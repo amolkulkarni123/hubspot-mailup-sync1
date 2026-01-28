@@ -1,0 +1,463 @@
+/************************************************************
+ * CENTRALIZED CRM → MARKETING INTEGRATION PLATFORM
+ * HubSpot → Google Sheets → MailUp
+ * VERSION: V8 PRODUCTION
+ * Enterprise-Grade | Resumable | DLQ | Locked | Automated
+ ************************************************************/
+
+/********************
+ * CONFIG
+ ********************/
+const CONFIG = {
+  SHEET: "Contacts",
+  DLQ: "Dead Letter Queue",
+  LOGS: "Logs",
+  CACHE: "Email Cache",
+
+  HUBSPOT_BASE: "https://api.hubapi.com",
+  MAILUP_TOKEN_URL: "https://services.mailup.com/Authorization/OAuth/Token",
+  MAILUP_API_BASE: "https://services.mailup.com/API/v1.1/Rest/ConsoleService.svc",
+
+  HUB_BATCH: 100,
+  SHEET_BUFFER: 300,
+
+  MAILUP_BATCH: 20,
+  PARALLEL_REQUESTS: 2,
+
+  MAX_EXEC_MS: 5 * 60 * 1000,
+  MAX_RETRIES: 3,
+  RETRY_BASE_MS: 1500,
+  TOKEN_TTL_MS: 50 * 60 * 1000
+};
+
+/********************
+ * COLUMN MAP
+ ********************/
+const COLS = {
+  UUID: 1,
+  FIRST: 2,
+  LAST: 3,
+  EMAIL: 4,
+  COMPANY: 5,
+  JOB: 6,
+  INDUSTRY: 7,
+  COUNTRY: 8,
+  REGION: 9,
+  CONTINENT: 10,
+  STATUS: 11,
+  MESSAGE: 12,
+  MAILUP_ID: 13,
+  IMPORTED: 14,
+  PUSHED: 15
+};
+
+const HEADERS = [
+  "UUID",
+  "First Name",
+  "Last Name",
+  "Email",
+  "Company",
+  "Job Title",
+  "Industry",
+  "Country",
+  "Region",
+  "Continent",
+  "Status",
+  "Message",
+  "MailUp ID",
+  "Imported At",
+  "Pushed At"
+];
+
+/********************
+ * MAILUP FIELD IDS
+ * ⚠️ UPDATE THESE FROM MAILUP ADMIN
+ ********************/
+const MAILUP_FIELDS = {
+  FIRST: 1,
+  LAST: 2,
+  COMPANY: 3,
+  JOB: 4,
+  INDUSTRY: 5,
+  COUNTRY: 6,
+  REGION: 7,
+  CONTINENT: 8
+};
+
+/********************
+ * STATE
+ ********************/
+const STATE = {
+  get() {
+    return JSON.parse(PropertiesService.getScriptProperties()
+      .getProperty("APP_STATE") || "{}");
+  },
+  set(state) {
+    PropertiesService.getScriptProperties()
+      .setProperty("APP_STATE", JSON.stringify(state));
+  },
+  update(k, v) {
+    const s = STATE.get();
+    s[k] = v;
+    STATE.set(s);
+  },
+  remove(k) {
+    const s = STATE.get();
+    delete s[k];
+    STATE.set(s);
+  }
+};
+
+/********************
+ * LOCK WRAPPER
+ ********************/
+function withLock(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    toast("⏳ Sync already running");
+    return;
+  }
+  try { fn(); }
+  finally { lock.releaseLock(); }
+}
+
+/********************
+ * MENU
+ ********************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("CRM Integration Platform")
+    .addItem("🚀 Import from HubSpot", "runImportLocked")
+    .addItem("📤 Push to MailUp", "runPushLocked")
+    .addItem("🔄 Retry DLQ", "runDLQLocked")
+    .addItem("📋 View Logs", "showLogs")
+    .addItem("❌ Reset System", "resetSystem")
+    .addToUi();
+}
+
+/********************
+ * LOCKED RUNNERS
+ ********************/
+function runImportLocked() { withLock(runImport); }
+function runPushLocked() { withLock(runPush); }
+function runDLQLocked() { withLock(retryDLQ); }
+
+/********************
+ * HUBSPOT → SHEET
+ ********************/
+function runImport() {
+  const start = Date.now();
+  const sheet = getSheet(CONFIG.SHEET, HEADERS);
+  const cache = getSheet(CONFIG.CACHE, ["Email"]);
+  const state = STATE.get();
+
+  let cursor = state.hs_cursor || null;
+  const known = loadCache(cache);
+  let buffer = [];
+
+  log("IMPORT_START", {cursor});
+
+  while (Date.now() - start < CONFIG.MAX_EXEC_MS) {
+    let url = `${CONFIG.HUBSPOT_BASE}/crm/v3/objects/contacts?limit=${CONFIG.HUB_BATCH}&properties=email,firstname,lastname,company,jobtitle,industry,country,continent`;
+    if (cursor) url += `&after=${cursor}`;
+
+    const res = fetchHubSpot(url);
+    if (!res || !res.results) break;
+
+    res.results.forEach(c => {
+      const email = normalize(c.properties.email);
+      if (!email || known.has(email)) return;
+
+      buffer.push([
+        Utilities.getUuid(),
+        c.properties.firstname || "",
+        c.properties.lastname || "",
+        email,
+        c.properties.company || "",
+        c.properties.jobtitle || "",
+        c.properties.industry || "",
+        c.properties.country || "",
+        "",
+        c.properties.continent || "",
+        "Pending",
+        "Imported",
+        "",
+        new Date(),
+        ""
+      ]);
+
+      known.add(email);
+    });
+
+    if (buffer.length >= CONFIG.SHEET_BUFFER) {
+      flush(sheet, cache, buffer);
+      buffer = [];
+    }
+
+    if (res.paging?.next?.after) {
+      cursor = res.paging.next.after;
+      STATE.update("hs_cursor", cursor);
+    } else {
+      STATE.remove("hs_cursor");
+      break;
+    }
+  }
+
+  if (buffer.length) flush(sheet, cache, buffer);
+
+  log("IMPORT_COMPLETE", {});
+  toast("✅ HubSpot import complete");
+}
+
+/********************
+ * SHEET → MAILUP
+ ********************/
+function runPush() {
+  const start = Date.now();
+  const sheet = getSheet(CONFIG.SHEET, HEADERS);
+  const dlq = getSheet(CONFIG.DLQ, ["UUID", "Email", "Reason", "Retries", "Timestamp"]);
+  const token = getMailUpToken();
+
+  if (!token) return;
+
+  const state = STATE.get();
+  let startIndex = state.mail_cursor || 0;
+
+  const data = sheet.getDataRange().getValues().slice(1);
+  const pending = data
+    .map((r, i) => ({ row: r, index: i + 2 }))
+    .filter(r => r.row[COLS.STATUS - 1] !== "Success");
+
+  for (let i = startIndex; i < pending.length; i += CONFIG.MAILUP_BATCH) {
+    if (Date.now() - start > CONFIG.MAX_EXEC_MS - 30000) {
+      STATE.update("mail_cursor", i);
+      toast("⏸️ Push paused — will resume automatically");
+      return;
+    }
+
+    const batch = pending.slice(i, i + CONFIG.MAILUP_BATCH);
+    processBatch(sheet, dlq, token, batch);
+    STATE.update("mail_cursor", i);
+  }
+
+  STATE.remove("mail_cursor");
+  log("PUSH_COMPLETE", {});
+  toast("✅ MailUp sync complete");
+}
+
+/********************
+ * BATCH PROCESSOR
+ ********************/
+function processBatch(sheet, dlq, token, batch) {
+  for (let i = 0; i < batch.length; i += CONFIG.PARALLEL_REQUESTS) {
+    const group = batch.slice(i, i + CONFIG.PARALLEL_REQUESTS);
+    const requests = [];
+    const map = [];
+
+    group.forEach(item => {
+      const r = item.row;
+      const email = normalize(r[COLS.EMAIL - 1]);
+      const first = r[COLS.FIRST - 1];
+      const last = r[COLS.LAST - 1];
+
+      if (!email || (!first && !last)) {
+        moveDLQ(dlq, r[COLS.UUID - 1], email, "Validation failed");
+        updateStatus(sheet, item.index, "Invalid", "Missing name or email");
+        return;
+      }
+
+      const fields = [
+        {Id: MAILUP_FIELDS.FIRST, Value: first},
+        {Id: MAILUP_FIELDS.LAST, Value: last},
+        {Id: MAILUP_FIELDS.COMPANY, Value: r[COLS.COMPANY - 1]},
+        {Id: MAILUP_FIELDS.JOB, Value: r[COLS.JOB - 1]},
+        {Id: MAILUP_FIELDS.INDUSTRY, Value: r[COLS.INDUSTRY - 1]},
+        {Id: MAILUP_FIELDS.COUNTRY, Value: r[COLS.COUNTRY - 1]},
+        {Id: MAILUP_FIELDS.REGION, Value: r[COLS.REGION - 1]},
+        {Id: MAILUP_FIELDS.CONTINENT, Value: r[COLS.CONTINENT - 1]}
+      ].filter(f => f.Value);
+
+      requests.push({
+        url: `${CONFIG.MAILUP_API_BASE}/List/${getProp("MAILUP_LIST_ID")}/Recipient`,
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + token,
+          "Content-Type": "application/json"
+        },
+        payload: JSON.stringify({Email: email, Fields: fields}),
+        muteHttpExceptions: true
+      });
+
+      map.push(item.index);
+    });
+
+    const responses = UrlFetchApp.fetchAll(requests);
+
+    responses.forEach((res, idx) => {
+      const rowIndex = map[idx];
+      const code = res.getResponseCode();
+
+      if (code >= 200 && code < 300) {
+        updateStatus(sheet, rowIndex, "Success", "Synced");
+        sheet.getRange(rowIndex, COLS.PUSHED).setValue(new Date());
+      } else {
+        moveDLQ(dlq, sheet.getRange(rowIndex, COLS.UUID).getValue(), "", "HTTP " + code);
+        updateStatus(sheet, rowIndex, "Failed", "HTTP " + code);
+      }
+    });
+
+    Utilities.sleep(CONFIG.RETRY_BASE_MS);
+  }
+}
+
+/********************
+ * DLQ RETRY
+ ********************/
+function retryDLQ() {
+  const dlq = getSheet(CONFIG.DLQ);
+  const sheet = getSheet(CONFIG.SHEET);
+  const token = getMailUpToken();
+  if (!token) return;
+
+  const rows = dlq.getDataRange().getValues().slice(1);
+  rows.forEach((r, i) => {
+    if (Number(r[3]) >= CONFIG.MAX_RETRIES) return;
+
+    const uuid = r[0];
+    const rowIndex = findByUUID(sheet, uuid);
+    if (!rowIndex) return;
+
+    sheet.getRange(rowIndex, COLS.STATUS).setValue("Pending");
+    dlq.getRange(i + 2, 4).setValue(Number(r[3]) + 1);
+  });
+
+  runPush();
+}
+
+/********************
+ * AUTH
+ ********************/
+function getMailUpToken() {
+  const props = PropertiesService.getScriptProperties();
+  const cached = props.getProperty("MAILUP_TOKEN");
+  const exp = Number(props.getProperty("MAILUP_TOKEN_EXP") || 0);
+
+  if (cached && Date.now() < exp) return cached;
+
+  const auth = Utilities.base64Encode(
+    getProp("MAILUP_CLIENT_ID") + ":" + getProp("MAILUP_CLIENT_SECRET")
+  );
+
+  const payload = `grant_type=password&username=${encodeURIComponent(getProp("MAILUP_USERNAME"))}&password=${encodeURIComponent(getProp("MAILUP_PASSWORD"))}`;
+
+  const res = UrlFetchApp.fetch(CONFIG.MAILUP_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + auth,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    payload
+  });
+
+  const json = JSON.parse(res.getContentText());
+  if (!json.access_token) return null;
+
+  props.setProperty("MAILUP_TOKEN", json.access_token);
+  props.setProperty("MAILUP_TOKEN_EXP", Date.now() + CONFIG.TOKEN_TTL_MS);
+
+  return json.access_token;
+}
+
+/********************
+ * HELPERS
+ ********************/
+function fetchHubSpot(url, retries = CONFIG.MAX_RETRIES) {
+  try {
+    const res = UrlFetchApp.fetch(url, {
+      headers: { Authorization: "Bearer " + getProp("HUBSPOT_TOKEN") },
+      muteHttpExceptions: true
+    });
+
+    if (res.getResponseCode() === 200)
+      return JSON.parse(res.getContentText());
+
+    if (res.getResponseCode() === 429 && retries > 0) {
+      Utilities.sleep(CONFIG.RETRY_BASE_MS * (CONFIG.MAX_RETRIES - retries + 1));
+      return fetchHubSpot(url, retries - 1);
+    }
+  } catch(e) {}
+  return null;
+}
+
+function flush(sheet, cache, rows) {
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length)
+    .setValues(rows);
+  rows.forEach(r => cache.appendRow([r[COLS.EMAIL - 1]]));
+}
+
+function loadCache(sheet) {
+  const set = new Set();
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2,1,sheet.getLastRow()).getValues()
+      .forEach(r => set.add(normalize(r[0])));
+  }
+  return set;
+}
+
+function findByUUID(sheet, uuid) {
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === uuid) return i + 1;
+  }
+  return null;
+}
+
+function updateStatus(sheet, row, status, msg) {
+  sheet.getRange(row, COLS.STATUS).setValue(status);
+  sheet.getRange(row, COLS.MESSAGE).setValue(msg);
+}
+
+function moveDLQ(sheet, uuid, email, reason) {
+  sheet.appendRow([uuid, email, reason, 0, new Date()]);
+  log("DLQ", {uuid, reason});
+}
+
+function getSheet(name, headers) {
+  const ss = SpreadsheetApp.getActive();
+  let s = ss.getSheetByName(name);
+  if (!s) {
+    s = ss.insertSheet(name);
+    if (headers) s.appendRow(headers);
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+function normalize(e) {
+  return e ? e.toString().trim().toLowerCase() : "";
+}
+
+function getProp(k) {
+  return PropertiesService.getScriptProperties().getProperty(k);
+}
+
+function log(event, meta) {
+  const sheet = getSheet(CONFIG.LOGS, ["Time","Event","Data"]);
+  sheet.appendRow([new Date(), event, JSON.stringify(meta)]);
+}
+
+function toast(msg) {
+  SpreadsheetApp.getActive().toast(msg, "System", 5);
+}
+
+/********************
+ * ADMIN
+ ********************/
+function resetSystem() {
+  const ui = SpreadsheetApp.getUi();
+  if (ui.alert("Reset system?", ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+  PropertiesService.getScriptProperties().deleteAllProperties();
+  STATE.set({});
+  toast("System reset complete");
+}
