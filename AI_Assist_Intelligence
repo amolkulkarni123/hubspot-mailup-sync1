@@ -1,1 +1,244 @@
+/**
+ * PULLS RECENT SIGNALS FROM HUBSPOT FOR AI ANALYSIS
+ * Production-Ready with:
+ * - Time safety & pagination
+ * - Proper deduplication
+ * - Error handling & logging
+ * - Verified API endpoints
+ */
 
+function ingestHubSpotSignals() {
+  const sheet = getOrCreateActivitySheet();
+  const logger = new Logger();
+  
+  try {
+    // ✅ 1. TIME CHECK
+    if (Date.now() - SCRIPT_START_TIME > CONFIG.MAX_TIME_MS) {
+      logger.log(WARN, "Time limit reached, skipping signal ingestion");
+      return;
+    }
+    
+    logger.log(INFO, "Starting HubSpot signals ingestion...");
+    
+    // ✅ 2. PROPER DEDUPLICATION (Using Set)
+    const existingIds = getExistingSignalIds(sheet);
+    logger.log(INFO, `Found ${existingIds.size} existing signals`);
+    
+    // ✅ 3. PAGINATION SUPPORT
+    let cursor = STATE.get().signal_cursor || null;
+    let hasMore = true;
+    let totalNew = 0;
+    let newSignalsBuffer = [];
+    
+    const properties = [
+      "hs_communication_channel_type",
+      "hs_communication_logged_from",
+      "hs_timestamp",
+      "hs_communication_subject"
+    ];
+    
+    const SIGNAL_BATCH_SIZE = 100;
+    const TIME_CHECK_INTERVAL = 5; // Check time every 5 iterations
+    let iterCount = 0;
+    
+    while (hasMore && (Date.now() - SCRIPT_START_TIME < CONFIG.MAX_TIME_MS)) {
+      // ✅ Build URL with cursor
+      let url = `https://api.hubapi.com/crm/v3/objects/communications?limit=${SIGNAL_BATCH_SIZE}&properties=${properties.join(",")}`;
+      if (cursor) url += `&after=${cursor}`;
+      
+      // ✅ Fetch with proper error handling
+      const response = fetchWithBackoff(url);
+      
+      if (!response) {
+        logger.log(ERROR, "Failed to fetch signals from HubSpot");
+        break;
+      }
+      
+      if (!response.results || response.results.length === 0) {
+        hasMore = false;
+        break;
+      }
+      
+      // ✅ Process signals
+      response.results.forEach(signal => {
+        const signalId = signal.id;
+        
+        // Skip if already processed
+        if (existingIds.has(signalId)) {
+          return;
+        }
+        
+        // ✅ Validate signal data
+        const validation = validateSignal(signal);
+        if (!validation.valid) {
+          logger.log(WARN, `Invalid signal ${signalId}: ${validation.error}`);
+          return;
+        }
+        
+        const sanitized = validation.sanitized;
+        
+        // ✅ Use actual activity timestamp, not current time
+        const activityDate = new Date(sanitized.timestamp);
+        
+        newSignalsBuffer.push([
+          activityDate,                      // Col A: When activity happened
+          sanitized.loggedFrom,             // Col B: Who
+          signalId,                         // Col C: Signal ID
+          "HubSpot",                        // Col D: Source
+          sanitized.channelType,            // Col E: Channel
+          sanitized.subject,                // Col F: Subject
+          "",                               // Col G: AI_Behavioral_Score (to be filled)
+          "",                               // Col H: Niche_Interest (to be filled)
+          "",                               // Col I: Last_Inference_Date (to be filled)
+          new Date()                        // Col J: Imported timestamp
+        ]);
+        
+        existingIds.add(signalId); // Add to cache
+        totalNew++;
+      });
+      
+      // ✅ Write buffer in batches
+      if (newSignalsBuffer.length >= 100) {
+        if (!safeWriteToSheet(sheet, newSignalsBuffer, sheet.getLastRow() + 1)) {
+          logger.log(ERROR, "Failed to write signals to sheet");
+          break;
+        }
+        logger.log(INFO, `Flushed ${newSignalsBuffer.length} signals`);
+        newSignalsBuffer = [];
+        SpreadsheetApp.flush();
+      }
+      
+      // ✅ Update cursor
+      if (response.paging && response.paging.next) {
+        cursor = response.paging.next.after;
+        STATE.update("signal_cursor", cursor);
+      } else {
+        hasMore = false;
+        STATE.delete("signal_cursor");
+      }
+      
+      // ✅ Periodic time check
+      iterCount++;
+      if (iterCount % TIME_CHECK_INTERVAL === 0) {
+        const elapsed = Date.now() - SCRIPT_START_TIME;
+        const remaining = CONFIG.MAX_TIME_MS - elapsed;
+        logger.log(INFO, `Time remaining: ${Math.round(remaining/1000)}s`);
+      }
+    }
+    
+    // ✅ Write remaining buffer
+    if (newSignalsBuffer.length > 0) {
+      safeWriteToSheet(sheet, newSignalsBuffer, sheet.getLastRow() + 1);
+      SpreadsheetApp.flush();
+    }
+    
+    logger.log(SUCCESS, `Signal ingestion complete: ${totalNew} new signals`);
+    logEvent("SIGNAL_INGESTION_SUCCESS", {
+      new_signals: totalNew,
+      total_in_sheet: sheet.getLastRow() - 1,
+      cursor_saved: cursor ? true : false,
+      duration_ms: Date.now() - SCRIPT_START_TIME
+    });
+    
+  } catch (error) {
+    logger.log(ERROR, `Signal ingestion failed: ${error.message}`);
+    logEvent("SIGNAL_INGESTION_ERROR", {error: error.message});
+  }
+}
+
+/**
+ * ✅ VALIDATE SIGNAL DATA
+ */
+function validateSignal(signal) {
+  const errors = [];
+  
+  if (!signal.id) errors.push("Missing signal ID");
+  if (!signal.properties) errors.push("Missing properties");
+  
+  const channelType = signal.properties?.hs_communication_channel_type || "";
+  const loggedFrom = signal.properties?.hs_communication_logged_from || "";
+  const timestamp = signal.properties?.hs_timestamp;
+  
+  if (!channelType) errors.push("Missing channel type");
+  if (!loggedFrom) errors.push("Missing logged_from");
+  if (!timestamp) errors.push("Missing timestamp");
+  
+  // Validate timestamp is valid
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) errors.push("Invalid timestamp");
+  
+  return {
+    valid: errors.length === 0,
+    error: errors.join("; "),
+    sanitized: {
+      channelType: channelType.trim().substring(0, 50),
+      loggedFrom: loggedFrom.trim().substring(0, 100),
+      subject: (signal.properties?.hs_communication_subject || "").trim().substring(0, 200),
+      timestamp: timestamp
+    }
+  };
+}
+
+/**
+ * ✅ GET EXISTING SIGNAL IDs (Proper Deduplication)
+ */
+function getExistingSignalIds(sheet) {
+  const set = new Set();
+  if (sheet.getLastRow() <= 1) return set;
+  
+  const data = sheet.getRange(2, 3, sheet.getLastRow() - 1, 1).getValues();
+  data.forEach(row => {
+    if (row[0]) set.add(String(row[0]).trim());
+  });
+  return set;
+}
+
+/**
+ * ✅ GET OR CREATE ACTIVITY SHEET WITH HEADERS
+ */
+function getOrCreateActivitySheet() {
+  let sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Raw Activity");
+  
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Raw Activity");
+    sheet.appendRow([
+      "Activity Date",
+      "Logged From",
+      "Signal ID",
+      "Source",
+      "Channel Type",
+      "Subject",
+      "AI Behavioral Score",
+      "Niche Interest",
+      "Last Inference Date",
+      "Imported At"
+    ]);
+    sheet.setFrozenRows(1);
+  }
+  
+  return sheet;
+}
+
+/**
+ * ✅ INTEGRATED INTO runSync()
+ */
+function runSync() {
+  console.log("🔄 Starting Scheduled Sync...");
+  
+  // 1. Import contacts from HubSpot
+  runInfinityFetch();
+  
+  // 2. Ingest signals (NEW)
+  ingestHubSpotSignals();
+  
+  // 3. Check if time remaining
+  const timeElapsed = Date.now() - SCRIPT_START_TIME;
+  const timeRemaining = CONFIG.MAX_TIME_MS - timeElapsed;
+  
+  if (timeRemaining > 60 * 1000) {
+    console.log(`⏱️ Time remaining: ${Math.round(timeRemaining/1000)}s. Pushing to MailUp...`);
+    pushSheetToMailUp();
+  } else {
+    console.log("⏳ Not enough time left for MailUp push. Will retry next cycle.");
+  }
+}
