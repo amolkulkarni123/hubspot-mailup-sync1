@@ -705,7 +705,12 @@ function assignSegments() {
 
       let segment = "General";
       for (const [tagKey, segmentName] of Object.entries(SEGMENT_MAP)) {
-        if (tag.includes(tagKey)) { segment = segmentName; break; }
+      // ✅ FIX: Use word-boundary regex instead of .includes() to prevent false
+      // positives where short keys like 'ai' match unrelated tags ('main','email','detail').
+      if (new RegExp(`(^|[_\\-\\s,])${tagKey}([_\\-\\s,]|$)`).test(tag) || tag === tagKey) {
+        segment = segmentName;
+        break;
+      }
       }
       contactsSheet.getRange(i + 1, COLUMNS_CONTACTS.AI_SEGMENT).setValue(segment);
       segmentedCount++;
@@ -1057,7 +1062,9 @@ function validateSignal(signal) {
 
 function isValidEmail(email) {
   if (!email || typeof email !== 'string') return false;
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+  // ✅ FIX: Strict allowlist regex — rejects XSS chars (<>), null bytes,
+  // quotes, and other special characters not valid in standard email addresses.
+  return /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/.test(email.trim());
 }
 
 // ============================================================
