@@ -89,7 +89,7 @@ const MAILUP_FIELD_IDS = {
   COMPANY: 3,
   JOB_TITLE: 4,
   INDUSTRY: 29,
-  COUNTRY: 31,
+  COUNTRY: 6,
   REGION: 7,
   CONTINENT: 30
 };
@@ -342,6 +342,7 @@ function pushSheetToMailUp() {
           }
 
           const sanitized = validation.sanitized;
+          // --- FINAL MAPPING BLOCK ---
           const fields = [
             {Id: MAILUP_FIELD_IDS.FIRST_NAME, Value: sanitized.firstName},
             {Id: MAILUP_FIELD_IDS.LAST_NAME, Value: sanitized.lastName},
@@ -349,10 +350,14 @@ function pushSheetToMailUp() {
           ];
 
           if (sanitized.jobTitle) fields.push({Id: MAILUP_FIELD_IDS.JOB_TITLE, Value: sanitized.jobTitle});
-          if (sanitized.industry) fields.push({Id: MAILUP_FIELD_IDS.INDUSTRY, Value: sanitized.industry});
+          if (sanitized.industry) fields.push({Id: MAILUP_FIELD_IDS.INDUSTRY, Value: sanitized.industry}); 
+          
+          // This now uses ID 31 automatically
           if (sanitized.country) fields.push({Id: MAILUP_FIELD_IDS.COUNTRY, Value: sanitized.country});
+          
           if (sanitized.region) fields.push({Id: MAILUP_FIELD_IDS.REGION, Value: sanitized.region});
           if (sanitized.continent) fields.push({Id: MAILUP_FIELD_IDS.CONTINENT, Value: sanitized.continent});
+          // --- UPDATED MAPPING BLOCK END ---
 
           requests.push({
             url: `${CONFIG.MAILUP_API_BASE}/List/${CONFIG.mailup_list_id}/Recipient`,
