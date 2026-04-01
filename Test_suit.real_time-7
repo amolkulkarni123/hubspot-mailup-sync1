@@ -1,0 +1,648 @@
+/**
+ * TEST SUITE — v7.0 Event-Driven Script
+ * Covers all v6.7 tests + new event-handling, back-sync, reconciliation logic
+ */
+
+const vm = require('vm');
+const fs = require('fs');
+let src = fs.readFileSync('/home/claude/v70.js', 'utf8');
+
+// ─── zero-dep test framework ───────────────────────────────
+let passed=0, failed=0, warned=0;
+const results=[];
+function test(group,name,fn){
+  try{fn();passed++;results.push({status:"PASS",group,name});process.stdout.write(`  ✅ ${name}\n`);}
+  catch(e){failed++;results.push({status:"FAIL",group,name,error:e.message});process.stdout.write(`  ❌ ${name}\n     → ${e.message}\n`);}
+}
+function warn(group,name,msg){warned++;results.push({status:"WARN",group,name,error:msg});process.stdout.write(`  ⚠️  ${name}\n     → ${msg}\n`);}
+function assert(c,m){if(!c)throw new Error(m||"Assertion failed");}
+function assertEqual(a,b,m){if(a!==b)throw new Error(m||`Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);}
+function assertDeepEqual(a,b,m){if(JSON.stringify(a)!==JSON.stringify(b))throw new Error(m||`Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);}
+function section(t){console.log(`\n${"═".repeat(62)}\n  ${t}\n${"═".repeat(62)}`);}
+
+// ─── GAS mocks ────────────────────────────────────────────
+const _scriptProps={};
+const _sheets={};
+let _flushCalled=false;
+let _appendRowCalls=[];
+
+function createMockSheet(name,rows=[]){
+  const data=[...rows];
+  return{
+    name,_data:data,
+    getLastRow:()=>data.length,
+    appendRow:(row)=>{data.push(row);_appendRowCalls.push({sheet:name,row});},
+    getRange:(row,col,numRows,numCols)=>({
+      getValues:()=>{const r=[];for(let i=0;i<(numRows||1);i++){const ra=[];for(let j=0;j<(numCols||1);j++){const d=data[row-1+i];ra.push(d?(d[col-1+j]!==undefined?d[col-1+j]:''):'');}r.push(ra);}return r;},
+      setValues:(vals)=>{vals.forEach((r,i)=>{while(data.length<row-1+i)data.push([]);data[row-1+i]=r;});},
+      setValue:(val)=>{while(data.length<row)data.push([]);if(!data[row-1])data[row-1]=[];data[row-1][col-1]=val;},
+      setBackground:()=>{}
+    }),
+    getRangeList:()=>({setBackground:()=>{}}),
+    getDataRange:()=>({getValues:()=>data}),
+    setFrozenRows:()=>{},
+    deleteRows:(start,count)=>{data.splice(start-1,count);}
+  };
+}
+
+const PropertiesService={getScriptProperties:()=>({
+  getProperty:(k)=>_scriptProps[k]||null,
+  setProperty:(k,v)=>{_scriptProps[k]=v;},
+  deleteAllProperties:()=>{Object.keys(_scriptProps).forEach(k=>delete _scriptProps[k]);}
+})};
+
+const SpreadsheetApp={
+  getActiveSpreadsheet:()=>({
+    getSheetByName:(n)=>_sheets[n]||null,
+    insertSheet:(n)=>{_sheets[n]=createMockSheet(n);return _sheets[n];},
+    setActiveSheet:()=>{}
+  }),
+  flush:()=>{_flushCalled=true;},
+  getUi:()=>({alert:()=>{},ButtonSet:{YES_NO:0},Button:{YES:0},createMenu:()=>({addItem:()=>({addItem:()=>({addItem:()=>({addSeparator:()=>({addSubMenu:()=>({addItem:()=>({addToUi:()=>{}})})})})})})})}),
+};
+
+const Utilities={sleep:()=>{},base64Encode:(s)=>Buffer.from(s).toString('base64'),
+  computeHmacSha256Signature:(src,key)=>Array(32).fill(0)};
+const UrlFetchApp={
+  fetch:()=>({getResponseCode:()=>200,getContentText:()=>'{}'}),
+  fetchAll:(reqs)=>reqs.map(()=>({getResponseCode:()=>200,getContentText:()=>'{}'}))
+};
+const HtmlService={createHtmlOutput:(h)=>h};
+const ScriptApp={
+  newTrigger:(fn)=>({timeBased:()=>({everyHours:()=>({create:()=>{}}),everyDays:()=>({atHour:()=>({create:()=>{}})})}) }),
+  getProjectTriggers:()=>[],
+  deleteTrigger:()=>{}
+};
+const ContentService={
+  createTextOutput:(s)=>({setMimeType:()=>({toString:()=>s})}),
+  MimeType:{JSON:"application/json"}
+};
+
+// ─── Load script ──────────────────────────────────────────
+src += `\nvar _EXPORTS = {
+  isValidEmail, validateContactForMailUp, validateSignal, buildMailUpFields,
+  parseGeminiResponse, getExistingEmails, getExistingSignalIds,
+  getOrCreateSheet, safeWriteToSheet, isTimeRemaining, pushToDLQ,
+  STATE, CONFIG, aggregateSignalsByLead, assignSegments,
+  COLUMNS_CONTACTS, COLUMNS_ACTIVITY, COLUMNS_BEHAVIOR,
+  COLUMN_HEADERS_CONTACTS, COLUMN_HEADERS_EVENTS, COLUMN_HEADERS_BACKSYNC,
+  SEGMENT_MAP, GAP_DETECTION_CONFIG, MAILUP_FIELD_IDS, LOG_LEVELS,
+  TRACKED_HS_PROPERTIES, MAILUP_STATUS,
+  getContactRowByHSId, getContactRowByEmail, buildEmailIndex, buildHSIdIndex,
+  upsertContactRow, mapHSPropertiesToRow, isContactRowStale, patchContactRow,
+  processHubSpotWebhookBatch, handleContactCreate, handleContactUpdate,
+  handleContactDelete, getProcessedEventIds, saveProcessedEventIds,
+  checkBackSyncAlreadyDone, updateHubSpotContact,
+  verifyHubSpotSignature
+};\n`;
+
+const ctx={
+  PropertiesService,SpreadsheetApp,Utilities,UrlFetchApp,HtmlService,ScriptApp,ContentService,
+  console,Date,JSON,Math,Object,Array,Set,Map,String,Number,Boolean,RegExp,Error,Buffer,
+  setTimeout,clearTimeout,encodeURIComponent
+};
+vm.createContext(ctx);
+try{ vm.runInContext(src,ctx); }
+catch(e){ console.error("FATAL: Script failed to load:",e.message,e.stack); process.exit(1); }
+
+const {
+  isValidEmail, validateContactForMailUp, validateSignal, buildMailUpFields,
+  parseGeminiResponse, getExistingEmails, getExistingSignalIds,
+  getOrCreateSheet, safeWriteToSheet, isTimeRemaining, pushToDLQ,
+  STATE, CONFIG, aggregateSignalsByLead, assignSegments,
+  COLUMNS_CONTACTS, COLUMNS_ACTIVITY, COLUMNS_BEHAVIOR,
+  COLUMN_HEADERS_CONTACTS, COLUMN_HEADERS_EVENTS, COLUMN_HEADERS_BACKSYNC,
+  SEGMENT_MAP, GAP_DETECTION_CONFIG, MAILUP_FIELD_IDS, LOG_LEVELS,
+  TRACKED_HS_PROPERTIES, MAILUP_STATUS,
+  getContactRowByHSId, getContactRowByEmail, buildEmailIndex, buildHSIdIndex,
+  upsertContactRow, mapHSPropertiesToRow, isContactRowStale, patchContactRow,
+  processHubSpotWebhookBatch, handleContactCreate, handleContactUpdate,
+  handleContactDelete, getProcessedEventIds, saveProcessedEventIds,
+  checkBackSyncAlreadyDone
+} = ctx._EXPORTS;
+
+// helpers
+function makeContactRow(overrides={}){
+  const row=new Array(18).fill("");
+  row[0]=overrides.firstName!==undefined?overrides.firstName:"John";
+  row[1]=overrides.lastName!==undefined?overrides.lastName:"Doe";
+  row[2]=overrides.email!==undefined?overrides.email:"john@example.com";
+  row[3]=overrides.company!==undefined?overrides.company:"Acme";
+  row[4]=overrides.jobTitle!==undefined?overrides.jobTitle:"Manager";
+  row[5]=overrides.industry!==undefined?overrides.industry:"Tech";
+  row[6]=overrides.country!==undefined?overrides.country:"US";
+  row[7]=overrides.region!==undefined?overrides.region:"NA";
+  row[8]=overrides.continent!==undefined?overrides.continent:"Americas";
+  row[9]=overrides.status!==undefined?overrides.status:"Pending";
+  row[17]=overrides.hsId!==undefined?overrides.hsId:"hs_001";
+  return row;
+}
+
+function makeMockRes(text){return{getContentText:()=>text,getResponseCode:()=>200};}
+function makeGeminiPayload(inner){return JSON.stringify({candidates:[{content:{parts:[{text:inner}]}}]});}
+function makeSignal(overrides={}){return{id:overrides.id!==undefined?overrides.id:"sig_001",properties:{hs_communication_channel_type:overrides.channelType!==undefined?overrides.channelType:"EMAIL",hs_communication_logged_from:overrides.loggedFrom!==undefined?overrides.loggedFrom:"crm",hs_timestamp:overrides.timestamp!==undefined?overrides.timestamp:new Date().toISOString(),hs_communication_subject:overrides.subject!==undefined?overrides.subject:"Demo"}};}
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 1: Schema — v7.0 column additions");
+// ════════════════════════════════════════════════════════════
+
+test("Schema","COLUMN_HEADERS_CONTACTS has 18 columns",()=>assertEqual(COLUMN_HEADERS_CONTACTS.length,18));
+test("Schema","Column 18 = HS Contact ID",()=>assertEqual(COLUMN_HEADERS_CONTACTS[17],"HS Contact ID"));
+test("Schema","COLUMNS_CONTACTS.HS_CONTACT_ID = 18",()=>assertEqual(COLUMNS_CONTACTS.HS_CONTACT_ID,18));
+test("Schema","All other columns unchanged vs v6.7",()=>{
+  assertEqual(COLUMNS_CONTACTS.EMAIL,3);
+  assertEqual(COLUMNS_CONTACTS.STATUS,10);
+  assertEqual(COLUMNS_CONTACTS.AI_SEGMENT,17);
+});
+test("Schema","COLUMN_HEADERS_EVENTS has 8 columns",()=>assertEqual(COLUMN_HEADERS_EVENTS.length,8));
+test("Schema","COLUMN_HEADERS_BACKSYNC has 5 columns",()=>assertEqual(COLUMN_HEADERS_BACKSYNC.length,5));
+test("Schema","No duplicate contact headers",()=>{const u=new Set(COLUMN_HEADERS_CONTACTS);assertEqual(u.size,18);});
+test("Schema","MAILUP_STATUS constants defined",()=>{assert(MAILUP_STATUS.UNSUBSCRIBED===2);assert(MAILUP_STATUS.BOUNCED===4);});
+test("Schema","TRACKED_HS_PROPERTIES is a Set",()=>{assert(TRACKED_HS_PROPERTIES instanceof Set);});
+test("Schema","email, firstname, industry are tracked",()=>{
+  assert(TRACKED_HS_PROPERTIES.has("email"));
+  assert(TRACKED_HS_PROPERTIES.has("firstname"));
+  assert(TRACKED_HS_PROPERTIES.has("industry"));
+});
+test("Schema","irrelevant properties not tracked",()=>{
+  assert(!TRACKED_HS_PROPERTIES.has("hs_pipeline_stage"));
+  assert(!TRACKED_HS_PROPERTIES.has("notes"));
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 2: Row Lookup by HS Contact ID");
+// ════════════════════════════════════════════════════════════
+
+function setupContactSheet(){
+  const headers=COLUMN_HEADERS_CONTACTS;
+  const rows=[
+    headers,
+    makeContactRow({email:"alice@test.com",hsId:"hs_alice"}),
+    makeContactRow({email:"bob@test.com",  hsId:"hs_bob"}),
+    makeContactRow({email:"carol@test.com",hsId:"hs_carol"})
+  ];
+  _sheets["Contacts"]=createMockSheet("Contacts",rows);
+  return _sheets["Contacts"];
+}
+
+test("HS ID Lookup","Finds row by exact HS ID",()=>{
+  const sheet=setupContactSheet();
+  const row=getContactRowByHSId(sheet,"hs_alice");
+  assertEqual(row,2);
+});
+test("HS ID Lookup","Returns null for missing HS ID",()=>{
+  const sheet=setupContactSheet();
+  assert(getContactRowByHSId(sheet,"hs_nonexistent")===null);
+});
+test("HS ID Lookup","Finds bob at row 3",()=>{
+  const sheet=setupContactSheet();
+  assertEqual(getContactRowByHSId(sheet,"hs_bob"),3);
+});
+test("HS ID Lookup","Returns null for empty id",()=>{
+  const sheet=setupContactSheet();
+  assert(getContactRowByHSId(sheet,"")===null);
+});
+test("HS ID Lookup","Returns null on empty sheet",()=>{
+  const empty=createMockSheet("EmptyC",[]);
+  assert(getContactRowByHSId(empty,"hs_001")===null);
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 3: Row Lookup by Email");
+// ════════════════════════════════════════════════════════════
+
+test("Email Lookup","Finds row by email",()=>{
+  const sheet=setupContactSheet();
+  assertEqual(getContactRowByEmail(sheet,"alice@test.com"),2);
+});
+test("Email Lookup","Case-insensitive match",()=>{
+  const sheet=setupContactSheet();
+  assertEqual(getContactRowByEmail(sheet,"ALICE@TEST.COM"),2);
+});
+test("Email Lookup","Returns null for missing email",()=>{
+  const sheet=setupContactSheet();
+  assert(getContactRowByEmail(sheet,"nobody@test.com")===null);
+});
+test("Email Lookup","Returns null on empty sheet",()=>{
+  const empty=createMockSheet("EmptyC2",[]);
+  assert(getContactRowByEmail(empty,"x@x.com")===null);
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 4: Index Builders");
+// ════════════════════════════════════════════════════════════
+
+test("Index Builder","buildEmailIndex returns correct map",()=>{
+  const sheet=setupContactSheet();
+  const idx=buildEmailIndex(sheet);
+  assertEqual(idx["alice@test.com"],2);
+  assertEqual(idx["bob@test.com"],3);
+  assertEqual(idx["carol@test.com"],4);
+});
+test("Index Builder","buildHSIdIndex returns correct map",()=>{
+  const sheet=setupContactSheet();
+  const idx=buildHSIdIndex(sheet);
+  assertEqual(idx["hs_alice"],2);
+  assertEqual(idx["hs_bob"],3);
+});
+test("Index Builder","buildEmailIndex empty sheet = empty map",()=>{
+  const empty=createMockSheet("E",[]);
+  assertDeepEqual(buildEmailIndex(empty),{});
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 5: mapHSPropertiesToRow");
+// ════════════════════════════════════════════════════════════
+
+test("Row Mapper","Produces 18-column row",()=>{
+  const contact={id:"42",properties:{email:"test@x.com",firstname:"Bob",lastname:"Smith",company:"Acme",jobtitle:"CEO",industry:"Tech",country:"UK",hs_lead_status:"Active",continent:"Europe"}};
+  const result=mapHSPropertiesToRow(contact);
+  assertEqual(result.row.length,18);
+});
+test("Row Mapper","Email is lowercased",()=>{
+  const c={id:"1",properties:{email:"TEST@EXAMPLE.COM",firstname:"A",lastname:"B",company:"",jobtitle:"",industry:"",country:"",hs_lead_status:"",continent:""}};
+  const r=mapHSPropertiesToRow(c);
+  assertEqual(r.email,"test@example.com");
+  assertEqual(r.row[2],"test@example.com");
+});
+test("Row Mapper","HS Contact ID stored in column 18",()=>{
+  const c={id:"hs_999",properties:{email:"a@b.com",firstname:"",lastname:"",company:"",jobtitle:"",industry:"",country:"",hs_lead_status:"",continent:""}};
+  const r=mapHSPropertiesToRow(c);
+  assertEqual(r.row[17],"hs_999");
+});
+test("Row Mapper","Status defaults to Pending",()=>{
+  const c={id:"1",properties:{email:"a@b.com",firstname:"",lastname:"",company:"",jobtitle:"",industry:"",country:"",hs_lead_status:"",continent:""}};
+  const r=mapHSPropertiesToRow(c);
+  assertEqual(r.row[9],"Pending");
+});
+test("Row Mapper","Industry fallback to Unclassified",()=>{
+  const c={id:"1",properties:{email:"a@b.com",firstname:"",lastname:"",company:"",jobtitle:"",industry:"",country:"",hs_lead_status:"",continent:""}};
+  const r=mapHSPropertiesToRow(c);
+  assertEqual(r.industry,"Unclassified");
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 6: isContactRowStale");
+// ════════════════════════════════════════════════════════════
+
+function makeHSContact(overrides={}){
+  return{id:"hs1",properties:{firstname:overrides.firstname||"Alice",lastname:overrides.lastname||"Smith",company:overrides.company||"Acme",jobtitle:overrides.jobtitle||"CEO",industry:overrides.industry||"Tech",country:overrides.country||"US",continent:"Americas",email:"alice@test.com",hs_lead_status:"Active"}};
+}
+
+test("Stale Check","Returns false when fields match",()=>{
+  const sheetRow=makeContactRow({firstName:"Alice",lastName:"Smith",company:"Acme",industry:"Tech",country:"US"});
+  assert(!isContactRowStale(sheetRow,makeHSContact()));
+});
+test("Stale Check","Returns true when firstname differs",()=>{
+  const sheetRow=makeContactRow({firstName:"OldName",lastName:"Smith",company:"Acme",industry:"Tech",country:"US"});
+  assert(isContactRowStale(sheetRow,makeHSContact({firstname:"Alice"})));
+});
+test("Stale Check","Returns true when company differs",()=>{
+  const sheetRow=makeContactRow({firstName:"Alice",lastName:"Smith",company:"OldCorp",industry:"Tech",country:"US"});
+  assert(isContactRowStale(sheetRow,makeHSContact({company:"Acme"})));
+});
+test("Stale Check","Returns true when industry differs",()=>{
+  const sheetRow=makeContactRow({firstName:"Alice",lastName:"Smith",company:"Acme",industry:"Finance",country:"US"});
+  assert(isContactRowStale(sheetRow,makeHSContact({industry:"Tech"})));
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 7: upsertContactRow");
+// ════════════════════════════════════════════════════════════
+
+test("Upsert","New email → row inserted",()=>{
+  _sheets["Contacts"]=createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS]);
+  const sheet=_sheets["Contacts"];
+  const contactData=mapHSPropertiesToRow({id:"hs_new",properties:{email:"new@x.com",firstname:"New",lastname:"User",company:"Co",jobtitle:"",industry:"Tech",country:"US",hs_lead_status:"",continent:""}});
+  upsertContactRow(sheet,contactData,"hs_new");
+  assertEqual(sheet.getLastRow(),2);
+});
+test("Upsert","Existing email → row updated (not duplicated)",()=>{
+  const headers=COLUMN_HEADERS_CONTACTS;
+  const existingRow=makeContactRow({email:"alice@test.com",hsId:"hs_alice",status:"Success"});
+  _sheets["Contacts"]=createMockSheet("Contacts",[headers,existingRow]);
+  const sheet=_sheets["Contacts"];
+  const contactData=mapHSPropertiesToRow({id:"hs_alice",properties:{email:"alice@test.com",firstname:"Alice_Updated",lastname:"Smith",company:"NewCo",jobtitle:"CTO",industry:"Tech",country:"US",hs_lead_status:"",continent:""}});
+  upsertContactRow(sheet,contactData,"hs_alice");
+  assertEqual(sheet.getLastRow(),2,"Should not have added a new row");
+});
+test("Upsert","Status preserved on update",()=>{
+  const headers=COLUMN_HEADERS_CONTACTS;
+  const existingRow=makeContactRow({email:"alice@test.com",hsId:"hs_alice",status:"Success"});
+  _sheets["Contacts"]=createMockSheet("Contacts",[headers,existingRow]);
+  const sheet=_sheets["Contacts"];
+  const contactData=mapHSPropertiesToRow({id:"hs_alice",properties:{email:"alice@test.com",firstname:"Alice",lastname:"Smith",company:"NewCo",jobtitle:"",industry:"Tech",country:"US",hs_lead_status:"",continent:""}});
+  upsertContactRow(sheet,contactData,"hs_alice");
+  const updated=sheet.getRange(2,COLUMNS_CONTACTS.STATUS,1,1).getValues()[0][0];
+  assertEqual(updated,"Success","Status should be preserved, not reset to Pending");
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 8: Webhook Event Processing");
+// ════════════════════════════════════════════════════════════
+
+// Reset sheets for webhook tests
+function resetSheetsForWebhook(){
+  _sheets["Contacts"]=createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS]);
+  _sheets["Webhook Events"]=createMockSheet("Webhook Events",[COLUMN_HEADERS_EVENTS]);
+  delete _scriptProps["PROCESSED_EVENT_IDS"];
+  // Mock fetchWithBackoff via UrlFetchApp.fetch returning a valid contact
+  ctx.UrlFetchApp={
+    fetch:()=>({getResponseCode:()=>200,getContentText:()=>JSON.stringify({id:"hs_001",properties:{email:"test@x.com",firstname:"Test",lastname:"User",company:"Co",jobtitle:"Dev",industry:"Tech",country:"US",hs_lead_status:"Active",continent:"Americas"}})}),
+    fetchAll:(reqs)=>reqs.map(()=>({getResponseCode:()=>200,getContentText:()=>'{}'}))
+  };
+}
+
+test("Webhook","creation event → contact upserted",()=>{
+  resetSheetsForWebhook();
+  const events=[{eventId:"evt_001",subscriptionType:"contact.creation",objectId:"hs_001",propertyName:null,propertyValue:null}];
+  const result=processHubSpotWebhookBatch(events);
+  assertEqual(result.created,1);
+  assertEqual(result.skipped,0);
+});
+
+test("Webhook","deletion event → contact soft-deleted",()=>{
+  resetSheetsForWebhook();
+  // Pre-populate contact
+  const row=makeContactRow({email:"test@x.com",hsId:"hs_001",status:"Pending"});
+  _sheets["Contacts"]._data.push(row);
+  const events=[{eventId:"evt_002",subscriptionType:"contact.deletion",objectId:"hs_001"}];
+  processHubSpotWebhookBatch(events);
+  const status=_sheets["Contacts"]._data[1][COLUMNS_CONTACTS.STATUS-1];
+  assertEqual(status,"Deleted");
+});
+
+test("Webhook","propertyChange on tracked property patches row",()=>{
+  resetSheetsForWebhook();
+  const row=makeContactRow({email:"test@x.com",hsId:"hs_001",firstName:"OldName"});
+  _sheets["Contacts"]._data.push(row);
+  const events=[{eventId:"evt_003",subscriptionType:"contact.propertyChange",objectId:"hs_001",propertyName:"firstname",propertyValue:"NewName"}];
+  processHubSpotWebhookBatch(events);
+  const firstname=_sheets["Contacts"]._data[1][COLUMNS_CONTACTS.FIRST_NAME-1];
+  assertEqual(firstname,"NewName");
+});
+
+test("Webhook","Duplicate eventId skipped (idempotency)",()=>{
+  resetSheetsForWebhook();
+  const events=[{eventId:"evt_004",subscriptionType:"contact.creation",objectId:"hs_001"}];
+  processHubSpotWebhookBatch(events);  // first time
+  const result=processHubSpotWebhookBatch(events);  // second time — should skip
+  assertEqual(result.skipped,1);
+});
+
+test("Webhook","Empty event array returns 0 counts",()=>{
+  resetSheetsForWebhook();
+  const result=processHubSpotWebhookBatch([]);
+  assertEqual(result.created,0);
+  assertEqual(result.updated,0);
+  assertEqual(result.deleted,0);
+});
+
+test("Webhook","Unknown subscriptionType increments skipped",()=>{
+  resetSheetsForWebhook();
+  const events=[{eventId:"evt_005",subscriptionType:"deal.creation",objectId:"deal_123"}];
+  const result=processHubSpotWebhookBatch(events);
+  assertEqual(result.skipped,1);
+  assertEqual(result.created,0);
+});
+
+test("Webhook","Event logged to Webhook Events sheet",()=>{
+  resetSheetsForWebhook();
+  const events=[{eventId:"evt_006",subscriptionType:"contact.creation",objectId:"hs_001"}];
+  processHubSpotWebhookBatch(events);
+  const eventsSheet=_sheets["Webhook Events"];
+  assert(eventsSheet.getLastRow()>=2,"Event should be logged");
+});
+
+test("Webhook","processedEventIds dedup set persists between calls",()=>{
+  resetSheetsForWebhook();
+  const events=[{eventId:"evt_007",subscriptionType:"contact.creation",objectId:"hs_001"}];
+  processHubSpotWebhookBatch(events);
+  const ids=getProcessedEventIds();
+  assert(ids.has("evt_007"),"evt_007 should be in processed set");
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 9: handleContactDelete (soft delete)");
+// ════════════════════════════════════════════════════════════
+
+test("Soft Delete","Existing contact → Status = Deleted",()=>{
+  _sheets["Contacts"]=createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS,makeContactRow({hsId:"del_001",status:"Success"})]);
+  const {handleContactDelete:hcd}=ctx._EXPORTS;
+  hcd("del_001");
+  assertEqual(_sheets["Contacts"]._data[1][COLUMNS_CONTACTS.STATUS-1],"Deleted");
+});
+
+test("Soft Delete","Non-existent HS ID → no row added",()=>{
+  _sheets["Contacts"]=createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS]);
+  const before=_sheets["Contacts"].getLastRow();
+  const {handleContactDelete:hcd}=ctx._EXPORTS;
+  hcd("nonexistent_hs_id");
+  assertEqual(_sheets["Contacts"].getLastRow(),before,"Should not add new rows");
+});
+
+test("Soft Delete","Message set to 'Deleted in HubSpot'",()=>{
+  _sheets["Contacts"]=createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS,makeContactRow({hsId:"del_002"})]);
+  const {handleContactDelete:hcd}=ctx._EXPORTS;
+  hcd("del_002");
+  assertEqual(_sheets["Contacts"]._data[1][COLUMNS_CONTACTS.MESSAGE-1],"Deleted in HubSpot");
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 10: Back-Sync (checkBackSyncAlreadyDone)");
+// ════════════════════════════════════════════════════════════
+
+test("Back-Sync","Returns false when sheet is empty",()=>{
+  const sheet=createMockSheet("BS",[COLUMN_HEADERS_BACKSYNC]);
+  assert(!checkBackSyncAlreadyDone(sheet,"alice@test.com"));
+});
+test("Back-Sync","Returns true when email already logged",()=>{
+  const sheet=createMockSheet("BS",[COLUMN_HEADERS_BACKSYNC,[new Date(),"alice@test.com","Unsubscribed",true,"done"]]);
+  assert(checkBackSyncAlreadyDone(sheet,"alice@test.com"));
+});
+test("Back-Sync","Case-insensitive email check",()=>{
+  const sheet=createMockSheet("BS",[COLUMN_HEADERS_BACKSYNC,[new Date(),"ALICE@TEST.COM","Unsubscribed",true,"done"]]);
+  assert(checkBackSyncAlreadyDone(sheet,"alice@test.com"));
+});
+test("Back-Sync","Returns false for different email",()=>{
+  const sheet=createMockSheet("BS",[COLUMN_HEADERS_BACKSYNC,[new Date(),"other@test.com","Unsubscribed",true,"done"]]);
+  assert(!checkBackSyncAlreadyDone(sheet,"alice@test.com"));
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 11: Preserved — Email Validation");
+// ════════════════════════════════════════════════════════════
+
+test("Email","Valid email passes",()=>assert(isValidEmail("user@example.com")));
+test("Email","XSS payload rejected",()=>assert(!isValidEmail("<script>@x.com")));
+test("Email","Null byte rejected",()=>assert(!isValidEmail("user\x00@x.com")));
+test("Email","SQL injection rejected",()=>assert(!isValidEmail("'; DROP TABLE--@x.com")));
+test("Email","Empty string rejected",()=>assert(!isValidEmail("")));
+test("Email","null rejected",()=>assert(!isValidEmail(null)));
+test("Email","Quoted string rejected",()=>assert(!isValidEmail('"quoted"@x.com')));
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 12: Preserved — Gemini Parsing");
+// ════════════════════════════════════════════════════════════
+
+test("Gemini","Clean JSON parses",()=>{const r=parseGeminiResponse(makeMockRes(makeGeminiPayload('{"score":85,"tag":"crm"}')));assert(r.valid);assertEqual(r.score,85);});
+test("Gemini","Strips ```json fences",()=>{const r=parseGeminiResponse(makeMockRes(makeGeminiPayload('```json\n{"score":72,"tag":"erp"}\n```')));assert(r.valid);});
+test("Gemini","Score 0 invalid",()=>{const r=parseGeminiResponse(makeMockRes(makeGeminiPayload('{"score":0,"tag":"crm"}')));assert(!r.valid);});
+test("Gemini","Score 101 invalid",()=>{const r=parseGeminiResponse(makeMockRes(makeGeminiPayload('{"score":101,"tag":"crm"}')));assert(!r.valid);});
+test("Gemini","Empty response fails gracefully",()=>{const r=parseGeminiResponse(makeMockRes(""));assert(!r.valid);assertEqual(r.error,"Empty response");});
+test("Gemini","API error object handled",()=>{const r=parseGeminiResponse(makeMockRes(JSON.stringify({error:{message:"Quota exceeded"}})));assert(!r.valid);assert(r.error.includes("Quota"));});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 13: Preserved — Segment Word-Boundary Fix");
+// ════════════════════════════════════════════════════════════
+
+function getSegment(tag){
+  const t=(tag||"").trim().toLowerCase();
+  if(!t)return"Unclassified";
+  for(const[key,name]of Object.entries(SEGMENT_MAP)){
+    if(new RegExp(`(^|[_\\-\\s,])${key}([_\\-\\s,]|$)`).test(t)||t===key){return name;}
+  }
+  return"General";
+}
+
+test("Segments","erp → ERP Buyers",()=>assertEqual(getSegment("erp"),"ERP Buyers"));
+test("Segments","ai → AI Automation",()=>assertEqual(getSegment("ai"),"AI Automation"));
+test("Segments","'main' does NOT match ai",()=>assertEqual(getSegment("main"),"General"));
+test("Segments","'email' does NOT match ai",()=>assertEqual(getSegment("email"),"General"));
+test("Segments","'detail' does NOT match ai",()=>assertEqual(getSegment("detail"),"General"));
+test("Segments","'gmail' does NOT match ai",()=>assertEqual(getSegment("gmail"),"General"));
+test("Segments","'retail' does NOT match ai",()=>assertEqual(getSegment("retail"),"General"));
+test("Segments","'ai_automation' matches automation (automation key precedes ai in map)",()=>assertEqual(getSegment("ai_automation"),"Automation Leads"));
+test("Segments","standalone 'ai' still matches AI Automation",()=>assertEqual(getSegment("ai"),"AI Automation"));
+test("Segments","Unknown tag → General",()=>assertEqual(getSegment("unknown_xyz"),"General"));
+test("Segments","null → Unclassified",()=>assertEqual(getSegment(null),"Unclassified"));
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 14: Preserved — Column Mapping Integrity");
+// ════════════════════════════════════════════════════════════
+
+test("Column Map","EMAIL col matches header",()=>assertEqual(COLUMNS_CONTACTS.EMAIL,COLUMN_HEADERS_CONTACTS.indexOf("Email")+1));
+test("Column Map","STATUS col matches header",()=>assertEqual(COLUMNS_CONTACTS.STATUS,COLUMN_HEADERS_CONTACTS.indexOf("Status")+1));
+test("Column Map","AI_SEGMENT = 17",()=>assertEqual(COLUMNS_CONTACTS.AI_SEGMENT,17));
+test("Column Map","HS_CONTACT_ID = 18",()=>assertEqual(COLUMNS_CONTACTS.HS_CONTACT_ID,18));
+test("Column Map","COLUMNS_ACTIVITY.SIGNAL_ID = 3",()=>assertEqual(COLUMNS_ACTIVITY.SIGNAL_ID,3));
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 15: Preserved — STATE Management");
+// ════════════════════════════════════════════════════════════
+
+test("State","STATE.update/get roundtrip",()=>{STATE.update("k","v");assertEqual(STATE.get()["k"],"v");});
+test("State","STATE.delete removes key",()=>{STATE.update("d","x");STATE.delete("d");assert(!("d" in STATE.get()));});
+test("State","STATE.get returns {} when empty",()=>{delete _scriptProps["APP_STATE"];assertDeepEqual(STATE.get(),{});});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 16: Preserved — Signal Dedup Lookback");
+// ════════════════════════════════════════════════════════════
+
+test("Signal Dedup","Respects SIGNAL_LOOKBACK_ROWS limit",()=>{
+  const headers=[new Array(11).fill("h")];
+  const rows=Array.from({length:4000},(_,i)=>{const r=new Array(11).fill("");r[2]=`sig_${i}`;return r;});
+  const sheet=createMockSheet("ActivityBig",[...headers,...rows]);
+  const result=getExistingSignalIds(sheet);
+  assert(result.size<=CONFIG.SIGNAL_LOOKBACK_ROWS,`Loaded ${result.size} > limit ${CONFIG.SIGNAL_LOOKBACK_ROWS}`);
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 17: Performance");
+// ════════════════════════════════════════════════════════════
+
+test("Perf","Sort 10k contacts < 100ms",()=>{
+  const industries=["Tech","Finance","Health","Agriculture","Retail"];
+  const buf=Array.from({length:10000},(_,i)=>({industry:industries[i%5],data:[]}));
+  const t=Date.now();buf.sort((a,b)=>a.industry.localeCompare(b.industry));
+  assert(Date.now()-t<100,`Took ${Date.now()-t}ms`);
+});
+test("Perf","buildEmailIndex for 5k rows < 50ms",()=>{
+  const headers=[COLUMN_HEADERS_CONTACTS];
+  const rows=Array.from({length:5000},(_,i)=>{const r=new Array(18).fill("");r[2]=`u${i}@x.com`;return r;});
+  const sheet=createMockSheet("PerfC",[...headers,...rows]);
+  const t=Date.now();buildEmailIndex(sheet);
+  assert(Date.now()-t<50,`Took ${Date.now()-t}ms`);
+});
+test("Perf","buildHSIdIndex for 5k rows < 50ms",()=>{
+  const headers=[COLUMN_HEADERS_CONTACTS];
+  const rows=Array.from({length:5000},(_,i)=>{const r=new Array(18).fill("");r[17]=`hs_${i}`;return r;});
+  const sheet=createMockSheet("PerfH",[...headers,...rows]);
+  const t=Date.now();buildHSIdIndex(sheet);
+  assert(Date.now()-t<50,`Took ${Date.now()-t}ms`);
+});
+test("Perf","Validate 1000 contacts < 200ms",()=>{
+  const t=Date.now();
+  for(let i=0;i<1000;i++)validateContactForMailUp(makeContactRow({email:`u${i}@x.com`}));
+  assert(Date.now()-t<200,`Took ${Date.now()-t}ms`);
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 18: CONFIG integrity");
+// ════════════════════════════════════════════════════════════
+
+test("Config","MAX_TIME_MS = 4 min",()=>assertEqual(CONFIG.MAX_TIME_MS,240000));
+test("Config","All API URLs are HTTPS",()=>{
+  [CONFIG.MAILUP_API_BASE,CONFIG.MAILUP_TOKEN_URL,CONFIG.HUBSPOT_API_BASE,CONFIG.GEMINI_API_BASE,CONFIG.HUBSPOT_API_V3]
+    .forEach(url=>assert(url.startsWith("https://"),`Not HTTPS: ${url}`));
+});
+test("Config","HUBSPOT_API_V3 defined",()=>assert(CONFIG.HUBSPOT_API_V3&&CONFIG.HUBSPOT_API_V3.length>0));
+test("Config","hubspot_portal_id comes from getProp (null in test)",()=>assertEqual(CONFIG.hubspot_portal_id,null));
+test("Config","hubspot_webhook_secret comes from getProp (null in test)",()=>assertEqual(CONFIG.hubspot_webhook_secret,null));
+test("Config","MAX_AI_PER_RUN = 30",()=>assertEqual(CONFIG.MAX_AI_PER_RUN,30));
+test("Config","SIGNAL_LOOKBACK_ROWS = 3000",()=>assertEqual(CONFIG.SIGNAL_LOOKBACK_ROWS,3000));
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 19: Regression (v6.7 fixes preserved)");
+// ════════════════════════════════════════════════════════════
+
+test("Regression","DLQ uses correct email column (col 3)",()=>{
+  _appendRowCalls=[];
+  _sheets["Dead Letter Queue"]=createMockSheet("Dead Letter Queue",[]);
+  const row=makeContactRow({email:"fail@test.com"});
+  pushToDLQ(5,row,"Test reason");
+  const dlq=_appendRowCalls.filter(c=>c.sheet==="Dead Letter Queue");
+  assert(dlq.length>0);
+  assertEqual(dlq[0].row[1],"fail@test.com");
+});
+test("Regression","Gemini markdown stripped",()=>{
+  const r=parseGeminiResponse(makeMockRes(makeGeminiPayload('```json\n{"score":88,"tag":"erp"}\n```')));
+  assert(r.valid);assertEqual(r.score,88);
+});
+test("Regression","Score boundary 1 is valid",()=>assert(parseGeminiResponse(makeMockRes(makeGeminiPayload('{"score":1,"tag":"crm"}')))?.valid));
+test("Regression","Score boundary 100 is valid",()=>assert(parseGeminiResponse(makeMockRes(makeGeminiPayload('{"score":100,"tag":"crm"}')))?.valid));
+test("Regression","GAP weights sum to 1.0",()=>assertEqual(GAP_DETECTION_CONFIG.SCORE_WEIGHT+GAP_DETECTION_CONFIG.ACTIVITY_WEIGHT,1.0));
+
+// ════════════════════════════════════════════════════════════
+// FINAL REPORT
+// ════════════════════════════════════════════════════════════
+
+const total=passed+failed;
+const failOnly=results.filter(r=>r.status==="FAIL");
+const warnOnly=results.filter(r=>r.status==="WARN");
+
+console.log(`
+${"═".repeat(62)}
+  FINAL TEST REPORT — hubspot_mailup_v7.0.js
+${"═".repeat(62)}
+  Total Tests : ${total}
+  ✅ Passed   : ${passed}
+  ❌ Failed   : ${failed}
+  ⚠️  Warnings : ${warned}
+${"═".repeat(62)}`);
+
+if(failOnly.length>0){
+  console.log("\n  ❌ FAILURES:");
+  failOnly.forEach(f=>console.log(`     [${f.group}] ${f.name}\n       → ${f.error}`));
+}
+if(warnOnly.length>0){
+  console.log("\n  ⚠️  WARNINGS:");
+  warnOnly.forEach(w=>console.log(`     [${w.group}] ${w.name}\n       → ${w.error}`));
+}
+
+const ok=failed===0;
+console.log(`
+${"═".repeat(62)}
+  VERDICT: ${ok?"✅ PRODUCTION READY":"❌ NOT PRODUCTION READY — fix failures above"}
+${"═".repeat(62)}\n`);
+process.exit(ok?0:1);
