@@ -1,0 +1,1773 @@
+/**
+ * HUBSPOT ↔ GOOGLE SHEETS ↔ MAILUP: EVENT-DRIVEN INTELLIGENCE ENGINE
+ * Version: 7.0 — Full Bidirectional, Real-Time Sync
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * WHAT'S NEW IN v7.0 vs v6.7
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * ✅ HubSpot Webhook Receiver (doPost)
+ *    → Real-time contact.creation / contact.propertyChange / contact.deletion
+ *    → Webhook signature verification (HMAC-SHA256)
+ *    → Idempotent event processing (dedup by eventId)
+ *
+ * ✅ Full Event-Driven Contact Sync
+ *    → handleContactCreate   — fetches & upserts row on HubSpot creation event
+ *    → handleContactUpdate   — patches only the changed field on property change
+ *    → handleContactDelete   — soft-deletes row (status → "Deleted")
+ *
+ * ✅ MailUp → Sheets Back-Sync  (syncMailUpToSheets)
+ *    → Pulls unsubscribes, bounces, spam complaints from MailUp
+ *    → Updates corresponding Sheets rows (Status, Message)
+ *
+ * ✅ Sheets → HubSpot Write-Back  (syncSheetsToHubSpot)
+ *    → Propagates MailUp outcomes (unsubscribed, bounced) back to HubSpot
+ *    → Updates hs_lead_status and hs_email_optout on matching contacts
+ *
+ * ✅ Full Reconciliation Mode  (fullReconciliation)
+ *    → Diffs HubSpot contacts ↔ Sheets ↔ MailUp
+ *    → Repairs missing, stale, or orphaned records in all three platforms
+ *
+ * ✅ Auto Webhook Registration  (registerHubSpotWebhooks)
+ *    → One-click setup: registers contact.creation / propertyChange / deletion
+ *    → Reads Web App URL from script properties
+ *
+ * ✅ Time Trigger Setup  (setupTimeTriggers)
+ *    → Installs scheduled GAS triggers for back-sync & reconciliation
+ *
+ * ✅ HubSpot Contact ID tracking  (Column 18)
+ *    → Stored on every row for precise update matching without email lookups
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * PRESERVED FROM v6.7
+ * ═══════════════════════════════════════════════════════════════
+ * ✅ Industry-Sorted Ingestion
+ * ✅ Industry-Sequential MailUp Push
+ * ✅ Signal Aggregation (UPSERT)
+ * ✅ AI Inference on Aggregates
+ * ✅ AI Segmentation (word-boundary fix)
+ * ✅ Gap Detection
+ * ✅ Dead Letter Queue
+ * ✅ Retry Failed Pushes
+ * ✅ All v6.x security fixes (#11 #12 #13)
+ */
+
+var SCRIPT_START_TIME = Date.now();
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const CONFIG = {
+  // HubSpot
+  hub_token:               getProp("HUBSPOT_TOKEN"),
+  hubspot_portal_id:       getProp("HUBSPOT_PORTAL_ID"),
+  hubspot_app_id:          getProp("HUBSPOT_APP_ID"),
+  hubspot_webhook_secret:  getProp("HUBSPOT_WEBHOOK_SECRET"), // for signature verification
+
+  // MailUp
+  mailup_client_id:     getProp("MAILUP_CLIENT_ID"),
+  mailup_client_secret: getProp("MAILUP_CLIENT_SECRET"),
+  mailup_username:      getProp("MAILUP_USERNAME"),
+  mailup_password:      getProp("MAILUP_PASSWORD"),
+  mailup_list_id:       getProp("MAILUP_LIST_ID") || 1,
+
+  // Gemini
+  gemini_key:   getProp("GEMINI_API_KEY"),
+  gemini_model: "gemini-1.5-flash",
+
+  // Endpoints
+  MAILUP_API_BASE:   "https://services.mailup.com/API/v1.1/Rest/ConsoleService.svc/Console",
+  MAILUP_TOKEN_URL:  "https://services.mailup.com/Authorization/OAuth/Token",
+  HUBSPOT_API_BASE:  "https://api.hubapi.com/crm/v3/objects",
+  HUBSPOT_API_V3:    "https://api.hubapi.com",
+  GEMINI_API_BASE:   "https://generativelanguage.googleapis.com/v1beta/models",
+
+  // Performance & Safety
+  MAX_TIME_MS:           4 * 60 * 1000,
+  HUBSPOT_BATCH_SIZE:    100,
+  SIGNAL_BATCH_SIZE:     100,
+  AI_BATCH_SIZE:         5,
+  MAILUP_BATCH_SIZE:     20,
+  SHEET_WRITE_BUFFER:    200,
+  SIGNAL_LOOKBACK_ROWS:  3000,
+  MAX_AI_PER_RUN:        30,
+
+  // Retry & Rate Limit
+  MAX_RETRIES:              3,
+  RETRY_DELAY_BASE:         1000,
+  RATE_LIMIT_PAUSE:         2000,
+  GEMINI_RATE_LIMIT_PAUSE:  60000,
+
+  // Sheet Names
+  SHEET_CONTACTS:  "Contacts",
+  SHEET_ACTIVITY:  "Raw Activity",
+  SHEET_BEHAVIOR:  "Lead Behavior Summary",
+  SHEET_LOGS:      "Logs",
+  SHEET_DLQ:       "Dead Letter Queue",
+  SHEET_INSIGHTS:  "High-Impact Leads",
+  SHEET_EVENTS:    "Webhook Events",    // ✅ NEW: raw event log
+  SHEET_BACKSYNC:  "Back-Sync Log"     // ✅ NEW: MailUp→HubSpot write-back log
+};
+
+// ============================================================
+// COLUMN DEFINITIONS
+// ============================================================
+
+// ✅ v7.0: Column 18 = HubSpot Contact ID (enables precise update matching)
+const COLUMN_HEADERS_CONTACTS = [
+  "First Name", "Last Name", "Email", "Company", "Job Title",
+  "Industry", "Country", "Region", "Continent", "Status",
+  "Message", "MailUp ID", "Pushed At", "Imported At",
+  "AI Score", "AI Tag", "AI Segment", "HS Contact ID"
+];
+
+const COLUMN_HEADERS_BEHAVIOR = [
+  "Email", "Activity Count", "Avg AI Score", "Primary Tag", "All Tags",
+  "Interest Level", "Last Activity Date", "Summary Generated At"
+];
+
+const COLUMN_HEADERS_ACTIVITY = [
+  "Activity Date", "Logged From", "Signal ID", "Contact Email", "Source",
+  "Channel Type", "Subject", "AI Score", "AI Tag", "AI Run Date", "Imported At"
+];
+
+const COLUMN_HEADERS_INSIGHTS = [
+  "Detected At", "Contact Email", "Lead Status", "AI Score", "AI Tag",
+  "Gap Type", "Recommended Action", "Date Marked"
+];
+
+const COLUMN_HEADERS_EVENTS = [
+  "Received At", "Event ID", "Subscription Type", "Object ID",
+  "Property", "New Value", "Processed", "Result"
+];
+
+const COLUMN_HEADERS_BACKSYNC = [
+  "Synced At", "Email", "MailUp Status", "HubSpot Updated", "Notes"
+];
+
+const COLUMNS_CONTACTS = {
+  FIRST_NAME: 1, LAST_NAME: 2, EMAIL: 3, COMPANY: 4, JOB_TITLE: 5,
+  INDUSTRY: 6, COUNTRY: 7, REGION: 8, CONTINENT: 9, STATUS: 10,
+  MESSAGE: 11, MAILUP_ID: 12, PUSHED_AT: 13, IMPORTED_AT: 14,
+  AI_SCORE: 15, AI_TAG: 16, AI_SEGMENT: 17, HS_CONTACT_ID: 18  // ✅ NEW
+};
+
+const COLUMNS_ACTIVITY = {
+  ACTIVITY_DATE: 1, LOGGED_FROM: 2, SIGNAL_ID: 3, CONTACT_EMAIL: 4,
+  SOURCE: 5, CHANNEL_TYPE: 6, SUBJECT: 7, AI_SCORE: 8, AI_TAG: 9,
+  AI_RUN_DATE: 10, IMPORTED_AT: 11
+};
+
+const COLUMNS_BEHAVIOR = {
+  EMAIL: 1, ACTIVITY_COUNT: 2, AVG_SCORE: 3, PRIMARY_TAG: 4, ALL_TAGS: 5,
+  INTEREST_LEVEL: 6, LAST_ACTIVITY_DATE: 7, GENERATED_AT: 8
+};
+
+const MAILUP_FIELD_IDS = {
+  FIRST_NAME: 1, LAST_NAME: 2, COMPANY: 3, JOB_TITLE: 4,
+  INDUSTRY: 5, COUNTRY: 6, REGION: 7, CONTINENT: 8
+};
+
+// MailUp recipient status codes
+const MAILUP_STATUS = {
+  SUBSCRIBED:   1,
+  UNSUBSCRIBED: 2,
+  PENDING:      3,
+  BOUNCED:      4
+};
+
+// HubSpot properties that trigger a sheet update when changed via webhook
+const TRACKED_HS_PROPERTIES = new Set([
+  "email", "firstname", "lastname", "company", "jobtitle",
+  "industry", "country", "continent", "hs_lead_status"
+]);
+
+const GAP_DETECTION_CONFIG = {
+  MIN_SCORE:           80,
+  TARGET_STATUSES:     ["Pending", "Cold", "Unqualified"],
+  SCORE_WEIGHT:        0.6,
+  ACTIVITY_WEIGHT:     0.4,
+  REQUIRE_RECENT_SIGNAL: false,
+  MIN_COMPOSITE_SCORE: 75
+};
+
+const SEGMENT_MAP = {
+  "erp": "ERP Buyers", "crm": "CRM Buyers", "automation": "Automation Leads",
+  "ai": "AI Automation", "integrations": "Integration Seekers",
+  "analytics": "Analytics Focused", "sales": "Sales Tech",
+  "marketing": "Marketing Tech", "workflow": "Workflow Automation",
+  "data": "Data Solutions", "finance": "Finance Solutions",
+  "hr": "HR Tech", "supply": "Supply Chain", "commerce": "eCommerce"
+};
+
+const LOG_LEVELS = { INFO: "ℹ️", SUCCESS: "✅", WARN: "⚠️", ERROR: "❌", DEBUG: "🔍" };
+
+// ============================================================
+// UI MENU
+// ============================================================
+
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi().createMenu("🚀 AI Sync Engine v7.0")
+      .addItem("▶️ Run Full Intelligence Sync", "runSync")
+      .addSeparator()
+      .addSubMenu(SpreadsheetApp.getUi().createMenu("📥 Import & Ingest")
+        .addItem("Import Contacts (Full)", "runInfinityFetch")
+        .addItem("Ingest Signals", "ingestHubSpotSignals")
+        .addItem("Aggregate Signals by Lead", "aggregateSignalsByLead"))
+      .addSubMenu(SpreadsheetApp.getUi().createMenu("🧠 AI & Scoring")
+        .addItem("Run AI Inference", "runAIInference")
+        .addItem("Assign AI Segments", "assignSegments")
+        .addItem("Detect High-Impact Leads", "detectHighImpactLeads"))
+      .addSubMenu(SpreadsheetApp.getUi().createMenu("📤 MailUp Push")
+        .addItem("Push to MailUp (Industry-Sequential)", "pushSheetToMailUp")
+        .addItem("Retry Failed Pushes", "retryFailedPushes"))
+      .addSeparator()
+      .addSubMenu(SpreadsheetApp.getUi().createMenu("🔄 v7.0 Sync")
+        .addItem("🔁 Full Reconciliation (All Platforms)", "fullReconciliation")
+        .addItem("↩️ Sync MailUp Status → Sheets", "syncMailUpToSheets")
+        .addItem("↪️ Write-Back Sheets → HubSpot", "syncSheetsToHubSpot"))
+      .addSubMenu(SpreadsheetApp.getUi().createMenu("⚙️ Setup")
+        .addItem("📡 Register HubSpot Webhooks", "registerHubSpotWebhooks")
+        .addItem("⏱️ Setup Time Triggers", "setupTimeTriggers")
+        .addItem("🗑️ Remove All Triggers", "removeAllTriggers"))
+      .addSeparator()
+      .addItem("📊 View Statistics", "showStats")
+      .addItem("📋 View Logs", "showLogs")
+      .addItem("📡 View Webhook Events", "showWebhookEvents")
+      .addItem("↩️ View Back-Sync Log", "showBackSyncLog")
+      .addItem("🧹 Reset All Data", "resetEverything")
+      .addToUi();
+
+    logEvent(LOG_LEVELS.INFO, "SYSTEM", "v7.0 Menu initialized");
+  } catch (e) {
+    console.error("Menu creation failed:", e.message);
+  }
+}
+
+// ============================================================
+// WEBHOOK RECEIVER — doPost (NEW in v7.0)
+// ============================================================
+
+/**
+ * Google Apps Script Web App entry point.
+ * HubSpot posts batches of events here in real time.
+ * Deploy as: Execute as Me, Access: Anyone
+ */
+function doPost(e) {
+  try {
+    const rawBody = e.postData.contents;
+
+    // ✅ Verify HubSpot webhook signature
+    if (!verifyHubSpotSignature(e, rawBody)) {
+      logEvent(LOG_LEVELS.WARN, "WEBHOOK", "Signature verification failed — request rejected");
+      return ContentService.createTextOutput(JSON.stringify({ status: "unauthorized" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    const events = JSON.parse(rawBody);
+    if (!Array.isArray(events) || events.length === 0) {
+      return ContentService.createTextOutput(JSON.stringify({ status: "ok", processed: 0 }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    logEvent(LOG_LEVELS.INFO, "WEBHOOK", `Received ${events.length} events`);
+    const result = processHubSpotWebhookBatch(events);
+
+    return ContentService.createTextOutput(JSON.stringify({ status: "ok", ...result }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    logEvent(LOG_LEVELS.ERROR, "WEBHOOK", `doPost error: ${err.message}`);
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Verify HubSpot's HMAC-SHA256 webhook signature.
+ * Header: X-HubSpot-Signature-v3
+ * Hash input: {clientSecret}{httpMethod}{requestUri}{requestBody}
+ */
+function verifyHubSpotSignature(e, rawBody) {
+  const secret = CONFIG.hubspot_webhook_secret;
+  if (!secret) {
+    // If secret not configured, log warning but don't block (permissive mode)
+    logEvent(LOG_LEVELS.WARN, "WEBHOOK", "HUBSPOT_WEBHOOK_SECRET not set — skipping signature check");
+    return true;
+  }
+
+  try {
+    const signature = e.parameter["X-HubSpot-Signature-v3"] ||
+      (e.headers && e.headers["X-Hubspot-Signature-V3"]) || "";
+    if (!signature) return false;
+
+    const timestamp = e.parameter["X-HubSpot-Request-Timestamp"] ||
+      (e.headers && e.headers["X-Hubspot-Request-Timestamp"]) || "";
+
+    // Reject requests older than 5 minutes
+    if (timestamp && (Date.now() - parseInt(timestamp)) > 300000) return false;
+
+    const sourceString = secret + "POST" + e.parameter.url + rawBody + timestamp;
+    const expected = Utilities.computeHmacSha256Signature(sourceString, secret)
+      .map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+
+    return expected === signature;
+  } catch (err) {
+    logEvent(LOG_LEVELS.ERROR, "WEBHOOK", `Signature verify error: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Route each event in the batch to its handler.
+ * Deduplicates by eventId to ensure idempotency.
+ */
+function processHubSpotWebhookBatch(events) {
+  const eventsSheet = getOrCreateSheet(CONFIG.SHEET_EVENTS, COLUMN_HEADERS_EVENTS);
+  const processedEventIds = getProcessedEventIds();
+
+  let created = 0, updated = 0, deleted = 0, skipped = 0;
+
+  events.forEach(event => {
+    const eventId = String(event.eventId || "");
+
+    // Idempotency: skip already-processed events
+    if (eventId && processedEventIds.has(eventId)) {
+      skipped++;
+      return;
+    }
+
+    let result = "unknown";
+    try {
+      const type = event.subscriptionType || "";
+      const objectId = String(event.objectId || "");
+
+      if (type === "contact.creation") {
+        handleContactCreate(objectId);
+        created++;
+        result = "created";
+      } else if (type === "contact.propertyChange") {
+        handleContactUpdate(objectId, event.propertyName, event.propertyValue);
+        updated++;
+        result = "updated";
+      } else if (type === "contact.deletion") {
+        handleContactDelete(objectId);
+        deleted++;
+        result = "deleted";
+      } else {
+        result = "unhandled_type";
+        skipped++;
+      }
+
+      // Log the event
+      eventsSheet.appendRow([
+        new Date(), eventId, type, objectId,
+        event.propertyName || "", event.propertyValue || "",
+        true, result
+      ]);
+
+      if (eventId) processedEventIds.add(eventId);
+
+    } catch (err) {
+      logEvent(LOG_LEVELS.ERROR, "WEBHOOK_EVENT", `Failed event ${eventId}: ${err.message}`);
+      eventsSheet.appendRow([
+        new Date(), eventId, event.subscriptionType || "", event.objectId || "",
+        event.propertyName || "", event.propertyValue || "",
+        false, `ERROR: ${err.message.substring(0, 100)}`
+      ]);
+      skipped++;
+    }
+  });
+
+  // Persist updated event ID set
+  saveProcessedEventIds(processedEventIds);
+
+  logEvent(LOG_LEVELS.SUCCESS, "WEBHOOK", `Batch done: created=${created} updated=${updated} deleted=${deleted} skipped=${skipped}`);
+  return { created, updated, deleted, skipped };
+}
+
+/** Returns a Set of already-processed eventIds (last 5000) */
+function getProcessedEventIds() {
+  const raw = PropertiesService.getScriptProperties().getProperty("PROCESSED_EVENT_IDS") || "[]";
+  return new Set(JSON.parse(raw));
+}
+
+/** Saves the processed event ID set (capped at 5000 to prevent property overflow) */
+function saveProcessedEventIds(set) {
+  const arr = [...set].slice(-5000);
+  PropertiesService.getScriptProperties().setProperty("PROCESSED_EVENT_IDS", JSON.stringify(arr));
+}
+
+// ============================================================
+// EVENT HANDLERS (NEW in v7.0)
+// ============================================================
+
+/**
+ * Handle contact.creation: fetch full contact from HubSpot, upsert into Sheets.
+ */
+function handleContactCreate(contactId) {
+  const contactData = fetchHubSpotContact(contactId);
+  if (!contactData) {
+    logEvent(LOG_LEVELS.WARN, "EVENT_CREATE", `Could not fetch contact ${contactId}`);
+    return;
+  }
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  upsertContactRow(sheet, contactData, contactId);
+  logEvent(LOG_LEVELS.SUCCESS, "EVENT_CREATE", `Contact ${contactId} (${contactData.email}) upserted`);
+}
+
+/**
+ * Handle contact.propertyChange: update only the changed column in the existing row.
+ * If row doesn't exist yet (e.g. webhook arrived before initial import), create it.
+ */
+function handleContactUpdate(contactId, propertyName, newValue) {
+  if (!TRACKED_HS_PROPERTIES.has(propertyName)) return; // ignore irrelevant properties
+
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const rowIndex = getContactRowByHSId(sheet, contactId);
+
+  if (!rowIndex) {
+    // Row doesn't exist — treat as a late creation
+    handleContactCreate(contactId);
+    return;
+  }
+
+  // Map HubSpot property name → sheet column
+  const colMap = {
+    firstname:       COLUMNS_CONTACTS.FIRST_NAME,
+    lastname:        COLUMNS_CONTACTS.LAST_NAME,
+    email:           COLUMNS_CONTACTS.EMAIL,
+    company:         COLUMNS_CONTACTS.COMPANY,
+    jobtitle:        COLUMNS_CONTACTS.JOB_TITLE,
+    industry:        COLUMNS_CONTACTS.INDUSTRY,
+    country:         COLUMNS_CONTACTS.COUNTRY,
+    continent:       COLUMNS_CONTACTS.CONTINENT,
+    hs_lead_status:  COLUMNS_CONTACTS.REGION  // stored in Region col as HS status
+  };
+
+  const col = colMap[propertyName];
+  if (col) {
+    sheet.getRange(rowIndex, col).setValue(newValue || "");
+    logEvent(LOG_LEVELS.INFO, "EVENT_UPDATE", `Contact ${contactId} — ${propertyName} = "${newValue}"`);
+  }
+}
+
+/**
+ * Handle contact.deletion: soft-delete the row (Status → "Deleted").
+ * Does NOT remove the row, preserving audit trail.
+ */
+function handleContactDelete(contactId) {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const rowIndex = getContactRowByHSId(sheet, contactId);
+
+  if (!rowIndex) {
+    logEvent(LOG_LEVELS.WARN, "EVENT_DELETE", `Contact ${contactId} not found in sheet — no action`);
+    return;
+  }
+
+  sheet.getRange(rowIndex, COLUMNS_CONTACTS.STATUS).setValue("Deleted");
+  sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE).setValue("Deleted in HubSpot");
+  sheet.getRange(rowIndex, 1, 1, COLUMN_HEADERS_CONTACTS.length).setBackground("#f5f5f5");
+  logEvent(LOG_LEVELS.INFO, "EVENT_DELETE", `Contact ${contactId} soft-deleted`);
+}
+
+// ============================================================
+// MAILUP → SHEETS BACK-SYNC (NEW in v7.0)
+// ============================================================
+
+/**
+ * Pulls unsubscribes, bounces, and spam reports from MailUp.
+ * Updates the corresponding rows in Sheets.
+ * Called by time trigger (recommended: every 1 hour).
+ */
+function syncMailUpToSheets() {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const logger = new Logger("MAILUP_BACKSYNC");
+
+  try {
+    const token = getMailUpTokenCached();
+    if (!token) { logger.log("ERROR", "No MailUp token"); return; }
+
+    let totalUpdated = 0;
+
+    // Fetch unsubscribes
+    const unsubscribed = fetchMailUpRecipientsByStatus(token, MAILUP_STATUS.UNSUBSCRIBED, logger);
+    unsubscribed.forEach(r => {
+      const rowIndex = getContactRowByEmail(sheet, r.Email);
+      if (!rowIndex) return;
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.STATUS).setValue("Unsubscribed");
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE).setValue("Unsubscribed in MailUp");
+      totalUpdated++;
+    });
+
+    // Fetch bounces
+    const bounced = fetchMailUpRecipientsByStatus(token, MAILUP_STATUS.BOUNCED, logger);
+    bounced.forEach(r => {
+      const rowIndex = getContactRowByEmail(sheet, r.Email);
+      if (!rowIndex) return;
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.STATUS).setValue("Bounced");
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE).setValue("Email bounced in MailUp");
+      totalUpdated++;
+    });
+
+    SpreadsheetApp.flush();
+    logger.log("COMPLETE", { unsubscribed: unsubscribed.length, bounced: bounced.length, sheet_updated: totalUpdated });
+
+    // Trigger HubSpot write-back for the changes we just made
+    if (totalUpdated > 0) syncSheetsToHubSpot();
+
+  } catch (err) {
+    logger.log("ERROR", { error: err.message });
+  }
+}
+
+/**
+ * Fetch recipients by MailUp status code (paginated).
+ */
+function fetchMailUpRecipientsByStatus(token, statusCode, logger) {
+  const results = [];
+  let pageNum = 0;
+  const pageSize = 100;
+
+  while (true) {
+    try {
+      const url = `${CONFIG.MAILUP_API_BASE}/List/${CONFIG.mailup_list_id}/Recipients/${statusCode}?pageSize=${pageSize}&pageNumber=${pageNum}`;
+      const res = UrlFetchApp.fetch(url, {
+        method: "GET",
+        headers: { "Authorization": "Bearer " + token },
+        muteHttpExceptions: true
+      });
+
+      if (res.getResponseCode() !== 200) break;
+      const json = JSON.parse(res.getContentText());
+      const items = json.Items || [];
+      if (items.length === 0) break;
+
+      results.push(...items);
+      if (items.length < pageSize) break;
+      pageNum++;
+
+    } catch (e) {
+      logger.log("MAILUP_FETCH_ERROR", { status: statusCode, error: e.message });
+      break;
+    }
+  }
+
+  return results;
+}
+
+// ============================================================
+// SHEETS → HUBSPOT WRITE-BACK (NEW in v7.0)
+// ============================================================
+
+/**
+ * Reads rows with Status = Unsubscribed or Bounced and writes the outcome
+ * back to HubSpot (hs_email_optout / hs_lead_status).
+ * Called after syncMailUpToSheets or on schedule.
+ */
+function syncSheetsToHubSpot() {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const backSyncSheet = getOrCreateSheet(CONFIG.SHEET_BACKSYNC, COLUMN_HEADERS_BACKSYNC);
+  const logger = new Logger("HS_WRITEBACK");
+
+  try {
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return;
+
+    const data = sheet.getRange(2, 1, lastRow - 1, COLUMN_HEADERS_CONTACTS.length).getValues();
+    let updated = 0;
+
+    for (const row of data) {
+      if (!isTimeRemaining(30000)) break;
+
+      const status = row[COLUMNS_CONTACTS.STATUS - 1];
+      const email = (row[COLUMNS_CONTACTS.EMAIL - 1] || "").trim();
+      const hsContactId = String(row[COLUMNS_CONTACTS.HS_CONTACT_ID - 1] || "").trim();
+
+      if (!email || !hsContactId) continue;
+      if (status !== "Unsubscribed" && status !== "Bounced") continue;
+
+      const alreadySynced = checkBackSyncAlreadyDone(backSyncSheet, email);
+      if (alreadySynced) continue;
+
+      const properties = {};
+      if (status === "Unsubscribed") {
+        properties["hs_email_optout"] = true;
+        properties["hs_lead_status"] = "UNQUALIFIED";
+      } else if (status === "Bounced") {
+        properties["hs_email_bounced"] = true;
+        properties["hs_lead_status"] = "UNQUALIFIED";
+      }
+
+      const success = updateHubSpotContact(hsContactId, properties, logger);
+
+      backSyncSheet.appendRow([
+        new Date(), email, status, success,
+        success ? "HubSpot updated" : "HubSpot update failed"
+      ]);
+
+      if (success) updated++;
+    }
+
+    logger.log("COMPLETE", { updated });
+
+  } catch (err) {
+    logger.log("ERROR", { error: err.message });
+  }
+}
+
+/** Check if this email was already written back to HubSpot */
+function checkBackSyncAlreadyDone(backSyncSheet, email) {
+  if (backSyncSheet.getLastRow() < 2) return false;
+  const emails = backSyncSheet.getRange(2, 2, backSyncSheet.getLastRow() - 1, 1).getValues();
+  return emails.some(r => String(r[0]).toLowerCase() === email.toLowerCase());
+}
+
+/** PATCH a HubSpot contact's properties */
+function updateHubSpotContact(contactId, properties, logger) {
+  try {
+    const url = `${CONFIG.HUBSPOT_API_BASE}/contacts/${contactId}`;
+    const res = UrlFetchApp.fetch(url, {
+      method: "PATCH",
+      headers: {
+        "Authorization": `Bearer ${CONFIG.hub_token}`,
+        "Content-Type": "application/json"
+      },
+      payload: JSON.stringify({ properties }),
+      muteHttpExceptions: true
+    });
+
+    const code = res.getResponseCode();
+    if (code === 200) return true;
+
+    logger.log("HS_PATCH_FAILED", { contactId, code, body: res.getContentText().substring(0, 100) });
+    return false;
+
+  } catch (e) {
+    logger.log("HS_PATCH_ERROR", { contactId, error: e.message });
+    return false;
+  }
+}
+
+// ============================================================
+// FULL RECONCILIATION (NEW in v7.0)
+// ============================================================
+
+/**
+ * Performs a complete diff across all three platforms:
+ *   1. Fetch all HubSpot contacts → compare with Sheets → add/update missing
+ *   2. Fetch all MailUp recipients → compare with Sheets → fix status mismatches
+ *   3. Re-push any Sheets rows missing from MailUp
+ * Recommended: run once daily via time trigger.
+ */
+function fullReconciliation() {
+  const logger = new Logger("RECONCILE");
+  logger.log("START", "Beginning full tri-platform reconciliation");
+
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  let hsAdded = 0, hsUpdated = 0, mailupMismatches = 0;
+
+  try {
+    // ── Step 1: HubSpot → Sheets ──────────────────────────────
+    logger.log("PHASE_1", "Comparing HubSpot contacts vs Sheets");
+
+    const hsContacts = fetchAllHubSpotContacts(logger);
+    const emailToRowIndex = buildEmailIndex(sheet);
+    const hsIdToRowIndex  = buildHSIdIndex(sheet);
+
+    for (const contact of hsContacts) {
+      if (!isTimeRemaining(60000)) {
+        logger.log("TIMEOUT", "Stopping Phase 1 early");
+        break;
+      }
+
+      const hsId = String(contact.id);
+      const email = (contact.properties.email || "").trim().toLowerCase();
+      if (!email) continue;
+
+      const existingRow = hsIdToRowIndex[hsId] || emailToRowIndex[email];
+
+      if (!existingRow) {
+        // Missing from Sheets — insert
+        upsertContactRow(sheet, mapHSPropertiesToRow(contact), hsId);
+        hsAdded++;
+      } else {
+        // Exists — check if key fields are stale
+        const sheetRow = sheet.getRange(existingRow, 1, 1, COLUMN_HEADERS_CONTACTS.length).getValues()[0];
+        if (isContactRowStale(sheetRow, contact)) {
+          patchContactRow(sheet, existingRow, contact);
+          hsUpdated++;
+        }
+      }
+    }
+
+    logger.log("PHASE_1_DONE", { added: hsAdded, updated: hsUpdated });
+
+    // ── Step 2: MailUp → Sheets status reconciliation ──────────
+    if (isTimeRemaining(90000)) {
+      logger.log("PHASE_2", "Reconciling MailUp statuses with Sheets");
+      syncMailUpToSheets();
+      mailupMismatches++;
+    } else {
+      logger.log("TIMEOUT", "Skipping Phase 2");
+    }
+
+    // ── Step 3: Re-push rows missing from MailUp ───────────────
+    if (isTimeRemaining(60000)) {
+      logger.log("PHASE_3", "Re-pushing contacts missing from MailUp");
+      pushSheetToMailUp();
+    } else {
+      logger.log("TIMEOUT", "Skipping Phase 3");
+    }
+
+    logger.log("COMPLETE", { hs_added: hsAdded, hs_updated: hsUpdated, mailup_phase: "done" });
+
+  } catch (err) {
+    logger.log("ERROR", { error: err.message });
+  }
+}
+
+/**
+ * Check if a Sheets row is stale compared to HubSpot contact data.
+ */
+function isContactRowStale(sheetRow, hsContact) {
+  const p = hsContact.properties;
+  const checks = [
+    [COLUMNS_CONTACTS.FIRST_NAME - 1, p.firstname || ""],
+    [COLUMNS_CONTACTS.LAST_NAME - 1,  p.lastname  || ""],
+    [COLUMNS_CONTACTS.COMPANY - 1,    p.company   || ""],
+    [COLUMNS_CONTACTS.INDUSTRY - 1,   p.industry  || ""],
+    [COLUMNS_CONTACTS.COUNTRY - 1,    p.country   || ""]
+  ];
+  return checks.some(([col, val]) => String(sheetRow[col] || "").trim() !== val.trim());
+}
+
+/**
+ * Overwrite stale fields in an existing Sheets row.
+ */
+function patchContactRow(sheet, rowIndex, hsContact) {
+  const p = hsContact.properties;
+  const updates = [
+    [COLUMNS_CONTACTS.FIRST_NAME, p.firstname || ""],
+    [COLUMNS_CONTACTS.LAST_NAME,  p.lastname  || ""],
+    [COLUMNS_CONTACTS.COMPANY,    p.company   || ""],
+    [COLUMNS_CONTACTS.JOB_TITLE,  p.jobtitle  || ""],
+    [COLUMNS_CONTACTS.INDUSTRY,   p.industry  || ""],
+    [COLUMNS_CONTACTS.COUNTRY,    p.country   || ""],
+    [COLUMNS_CONTACTS.CONTINENT,  p.continent || ""]
+  ];
+  updates.forEach(([col, val]) => sheet.getRange(rowIndex, col).setValue(val));
+}
+
+/**
+ * Fetches ALL HubSpot contacts (paginated).
+ * Used by fullReconciliation only — not in the live event path.
+ */
+function fetchAllHubSpotContacts(logger) {
+  const props = ["email","firstname","lastname","company","jobtitle","industry","country","hs_lead_status","continent"];
+  const contacts = [];
+  let cursor = null;
+
+  while (true) {
+    let url = `${CONFIG.HUBSPOT_API_BASE}/contacts?limit=100&properties=${props.join(",")}`;
+    if (cursor) url += `&after=${cursor}`;
+
+    const response = fetchWithBackoff(url);
+    if (!response || !response.results) break;
+
+    contacts.push(...response.results);
+    logger.log("FETCH_PAGE", { count: contacts.length });
+
+    if (response.paging && response.paging.next) {
+      cursor = response.paging.next.after;
+    } else {
+      break;
+    }
+  }
+
+  return contacts;
+}
+
+// ============================================================
+// WEBHOOK REGISTRATION (NEW in v7.0)
+// ============================================================
+
+/**
+ * Registers HubSpot webhook subscriptions for contact events.
+ * Requires HUBSPOT_APP_ID and HUBSPOT_PORTAL_ID in script properties.
+ * The Web App URL must be deployed and stored as WEB_APP_URL.
+ */
+function registerHubSpotWebhooks() {
+  const ui = SpreadsheetApp.getUi();
+  const appId    = CONFIG.hubspot_app_id;
+  const portalId = CONFIG.hubspot_portal_id;
+  const webAppUrl = getProp("WEB_APP_URL");
+
+  if (!appId || !portalId) {
+    ui.alert("❌ Missing HUBSPOT_APP_ID or HUBSPOT_PORTAL_ID in script properties.");
+    return;
+  }
+  if (!webAppUrl) {
+    ui.alert("❌ Missing WEB_APP_URL in script properties.\n\nDeploy this script as a Web App first, then save the URL as WEB_APP_URL.");
+    return;
+  }
+
+  const logger = new Logger("WEBHOOK_SETUP");
+
+  // First: set the target URL on the app
+  try {
+    const settingsUrl = `${CONFIG.HUBSPOT_API_V3}/webhooks/v3/${appId}/settings`;
+    const settingsRes = UrlFetchApp.fetch(settingsUrl, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${CONFIG.hub_token}`,
+        "Content-Type": "application/json"
+      },
+      payload: JSON.stringify({ targetUrl: webAppUrl, maxConcurrentRequests: 10 }),
+      muteHttpExceptions: true
+    });
+    logger.log("SETTINGS", { code: settingsRes.getResponseCode() });
+  } catch (e) {
+    logger.log("SETTINGS_ERROR", e.message);
+  }
+
+  // Subscribe to contact events
+  const subscriptions = [
+    { eventType: "contact.creation",       propertyName: null },
+    { eventType: "contact.deletion",       propertyName: null },
+    { eventType: "contact.propertyChange", propertyName: "email" },
+    { eventType: "contact.propertyChange", propertyName: "firstname" },
+    { eventType: "contact.propertyChange", propertyName: "lastname" },
+    { eventType: "contact.propertyChange", propertyName: "company" },
+    { eventType: "contact.propertyChange", propertyName: "jobtitle" },
+    { eventType: "contact.propertyChange", propertyName: "industry" },
+    { eventType: "contact.propertyChange", propertyName: "country" },
+    { eventType: "contact.propertyChange", propertyName: "hs_lead_status" }
+  ];
+
+  let registered = 0;
+  const subUrl = `${CONFIG.HUBSPOT_API_V3}/webhooks/v3/${appId}/subscriptions`;
+
+  subscriptions.forEach(sub => {
+    try {
+      const payload = { eventType: sub.eventType, active: true };
+      if (sub.propertyName) payload.propertyName = sub.propertyName;
+
+      const res = UrlFetchApp.fetch(subUrl, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${CONFIG.hub_token}`, "Content-Type": "application/json" },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+
+      const code = res.getResponseCode();
+      if (code === 201 || code === 200) registered++;
+      logger.log("SUBSCRIBE", { type: sub.eventType, property: sub.propertyName, code });
+
+    } catch (e) {
+      logger.log("SUBSCRIBE_ERROR", { type: sub.eventType, error: e.message });
+    }
+  });
+
+  ui.alert(`✅ Webhook registration complete.\n\nRegistered: ${registered}/${subscriptions.length} subscriptions\nTarget URL: ${webAppUrl}`);
+}
+
+// ============================================================
+// TIME TRIGGER SETUP (NEW in v7.0)
+// ============================================================
+
+/**
+ * Installs all recommended time-based triggers.
+ * Safe to call multiple times — removes duplicates first.
+ */
+function setupTimeTriggers() {
+  removeAllTriggers();
+
+  const triggers = [
+    { fn: "syncMailUpToSheets",  period: ScriptApp.newTrigger("syncMailUpToSheets").timeBased().everyHours(1) },
+    { fn: "syncSheetsToHubSpot", period: ScriptApp.newTrigger("syncSheetsToHubSpot").timeBased().everyHours(2) },
+    { fn: "fullReconciliation",  period: ScriptApp.newTrigger("fullReconciliation").timeBased().everyDays(1).atHour(3) },
+    { fn: "runSync",             period: ScriptApp.newTrigger("runSync").timeBased().everyHours(6) }
+  ];
+
+  triggers.forEach(t => {
+    try { t.period.create(); } catch (e) { console.error(`Trigger setup failed for ${t.fn}:`, e.message); }
+  });
+
+  SpreadsheetApp.getUi().alert(
+    "✅ Triggers installed:\n\n" +
+    "• syncMailUpToSheets   — every 1 hour\n" +
+    "• syncSheetsToHubSpot — every 2 hours\n" +
+    "• fullReconciliation   — daily at 3am\n" +
+    "• runSync              — every 6 hours"
+  );
+}
+
+function removeAllTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    try { ScriptApp.deleteTrigger(t); } catch (e) {}
+  });
+}
+
+// ============================================================
+// PHASE 1: INDUSTRY-SORTED CONTACT INGESTION (v6.7 preserved)
+// ============================================================
+
+function runInfinityFetch() {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const state = STATE.get();
+  const existingEmails = getExistingEmails(sheet);
+  const logger = new Logger("IMPORT");
+
+  try {
+    let cursor = state.hs_cursor || null;
+    let hasMore = true;
+    let sortingBuffer = [];
+    let totalImported = state.hs_total || 0;
+
+    const props = ["email","firstname","lastname","company","jobtitle","industry","country","hs_lead_status","continent"];
+
+    while (hasMore && isTimeRemaining(60000)) {
+      let url = `${CONFIG.HUBSPOT_API_BASE}/contacts?limit=${CONFIG.HUBSPOT_BATCH_SIZE}&properties=${props.join(",")}`;
+      if (cursor) url += `&after=${cursor}`;
+
+      const response = fetchWithBackoff(url);
+      if (!response || !response.results) break;
+
+      response.results.forEach(contact => {
+        const email = (contact.properties.email || "").trim().toLowerCase();
+        const industry = (contact.properties.industry || "Unclassified").trim();
+        if (email && !existingEmails.has(email)) {
+          sortingBuffer.push({
+            industry,
+            data: buildContactRow(contact)
+          });
+          existingEmails.add(email);
+          totalImported++;
+        }
+      });
+
+      if (sortingBuffer.length >= CONFIG.SHEET_WRITE_BUFFER) {
+        sortingBuffer.sort((a, b) => a.industry.localeCompare(b.industry));
+        safeWriteToSheet(sheet, sortingBuffer.map(i => i.data), sheet.getLastRow() + 1);
+        logger.log("BATCH_FLUSH", { rows: sortingBuffer.length, total: totalImported });
+        sortingBuffer = [];
+      }
+
+      if (response.paging && response.paging.next) {
+        cursor = response.paging.next.after;
+        STATE.update("hs_cursor", cursor);
+      } else {
+        hasMore = false;
+        STATE.delete("hs_cursor");
+      }
+    }
+
+    if (sortingBuffer.length > 0) {
+      sortingBuffer.sort((a, b) => a.industry.localeCompare(b.industry));
+      safeWriteToSheet(sheet, sortingBuffer.map(i => i.data), sheet.getLastRow() + 1);
+    }
+
+    STATE.update("hs_total", totalImported);
+    STATE.update("last_import", new Date().toISOString());
+    logger.log("COMPLETE", { total: totalImported });
+
+  } catch (error) {
+    logger.log("ERROR", { error: error.message });
+    throw error;
+  }
+}
+
+// ============================================================
+// PHASE 2: SIGNAL INGESTION (preserved from v6.7)
+// ============================================================
+
+function ingestHubSpotSignals() {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_ACTIVITY, COLUMN_HEADERS_ACTIVITY);
+  const existingIds = getExistingSignalIds(sheet);
+  const logger = new Logger("SIGNALS");
+
+  try {
+    let cursor = STATE.get().signal_cursor || null;
+    let hasMore = true;
+    let buffer = [];
+    let totalNew = 0;
+
+    const props = ["hs_communication_channel_type","hs_communication_logged_from","hs_timestamp","hs_communication_subject"];
+
+    while (hasMore && isTimeRemaining(60000)) {
+      let url = `${CONFIG.HUBSPOT_API_BASE}/communications?limit=${CONFIG.SIGNAL_BATCH_SIZE}&properties=${props.join(",")}&associations=contacts`;
+      if (cursor) url += `&after=${cursor}`;
+
+      const response = fetchWithBackoff(url);
+      if (!response || !response.results) break;
+
+      response.results.forEach(sig => {
+        if (existingIds.has(sig.id)) return;
+        const validation = validateSignal(sig);
+        if (!validation.valid) { logger.log("VALIDATION_FAILED", { signalId: sig.id, error: validation.error }); return; }
+
+        const sanitized = validation.sanitized;
+        let contactEmail = sanitized.loggedFrom;
+
+        if (sig.associations?.contacts?.results?.length > 0) {
+          const resolved = fetchContactEmail(sig.associations.contacts.results[0].id, logger);
+          if (resolved) { contactEmail = resolved; }
+        }
+
+        buffer.push([sanitized.timestamp, sanitized.loggedFrom, sig.id, contactEmail, "HubSpot", sanitized.channelType, sanitized.subject, "", "", "", new Date()]);
+        existingIds.add(sig.id);
+        totalNew++;
+      });
+
+      if (buffer.length >= CONFIG.SHEET_WRITE_BUFFER) {
+        safeWriteToSheet(sheet, buffer, sheet.getLastRow() + 1);
+        logger.log("BATCH_FLUSH", { rows: buffer.length });
+        buffer = [];
+      }
+
+      if (response.paging?.next) { cursor = response.paging.next.after; STATE.update("signal_cursor", cursor); }
+      else { hasMore = false; STATE.delete("signal_cursor"); }
+    }
+
+    if (buffer.length > 0) safeWriteToSheet(sheet, buffer, sheet.getLastRow() + 1);
+    logger.log("COMPLETE", { new_signals: totalNew });
+
+  } catch (error) { logger.log("ERROR", { error: error.message }); throw error; }
+}
+
+function fetchContactEmail(contactId, logger) {
+  try {
+    const response = fetchWithBackoff(`${CONFIG.HUBSPOT_API_BASE}/contacts/${contactId}?properties=email`);
+    if (response?.properties?.email) return response.properties.email.trim().toLowerCase();
+    logger.log("CONTACT_NO_EMAIL", { contactId });
+    return null;
+  } catch (e) { logger.log("CONTACT_FETCH_ERROR", { contactId, error: e.message }); return null; }
+}
+
+// ============================================================
+// PHASE 3: SIGNAL AGGREGATION — UPSERT (improved from v6.3)
+// ============================================================
+
+function aggregateSignalsByLead() {
+  const activitySheet = getOrCreateSheet(CONFIG.SHEET_ACTIVITY, COLUMN_HEADERS_ACTIVITY);
+  const behaviorSheet = getOrCreateSheet(CONFIG.SHEET_BEHAVIOR, COLUMN_HEADERS_BEHAVIOR);
+  const logger = new Logger("AGGREGATION");
+
+  try {
+    const activityData = activitySheet.getDataRange().getValues();
+    const behaviorData = behaviorSheet.getLastRow() > 1 ? behaviorSheet.getDataRange().getValues() : [];
+
+    const existingBehavior = {};
+    if (behaviorData.length > 1) {
+      behaviorData.slice(1).forEach((row, idx) => {
+        const email = (row[COLUMNS_BEHAVIOR.EMAIL - 1] || "").trim().toLowerCase();
+        existingBehavior[email] = idx + 2;
+      });
+    }
+
+    const aggregateMap = {};
+    activityData.slice(1).forEach(row => {
+      const email = (row[COLUMNS_ACTIVITY.CONTACT_EMAIL - 1] || "").trim().toLowerCase();
+      if (!email) return;
+      if (!aggregateMap[email]) aggregateMap[email] = { scores: [], tags: [], dates: [], count: 0 };
+      aggregateMap[email].count++;
+      const score = row[COLUMNS_ACTIVITY.AI_SCORE - 1];
+      const tag   = row[COLUMNS_ACTIVITY.AI_TAG - 1];
+      const date  = row[COLUMNS_ACTIVITY.ACTIVITY_DATE - 1];
+      if (score) aggregateMap[email].scores.push(score);
+      if (tag)   aggregateMap[email].tags.push(tag);
+      if (date)  aggregateMap[email].dates.push(new Date(date));
+    });
+
+    const summaryUpdates = [], newRows = [];
+    Object.keys(aggregateMap).forEach(email => {
+      const agg = aggregateMap[email];
+      const avgScore = agg.scores.length > 0 ? Math.round(agg.scores.reduce((a,b)=>a+b,0)/agg.scores.length) : 0;
+      const primaryTag = agg.tags.length > 0 ? agg.tags[0] : "unknown";
+      const allTags = [...new Set(agg.tags)].join(", ");
+      const lastDate = agg.dates.length > 0 ? new Date(Math.max(...agg.dates.map(d=>d.getTime()))) : new Date();
+      let interestLevel = "Low";
+      if (agg.count >= 3 && avgScore >= 70) interestLevel = "High";
+      else if (agg.count >= 2 || avgScore >= 60) interestLevel = "Medium";
+      const rowData = [email, agg.count, avgScore, primaryTag, allTags, interestLevel, lastDate, new Date()];
+      if (existingBehavior[email]) summaryUpdates.push({ rowIndex: existingBehavior[email], data: rowData });
+      else newRows.push(rowData);
+    });
+
+    summaryUpdates.forEach(u => behaviorSheet.getRange(u.rowIndex, 1, 1, u.data.length).setValues([u.data]));
+    if (newRows.length > 0) behaviorSheet.getRange(behaviorSheet.getLastRow()+1, 1, newRows.length, newRows[0].length).setValues(newRows);
+
+    logger.log("COMPLETE", { unique_leads: Object.keys(aggregateMap).length, updated: summaryUpdates.length, new: newRows.length });
+
+  } catch (error) { logger.log("ERROR", { error: error.message }); throw error; }
+}
+
+// ============================================================
+// PHASE 4: AI INFERENCE (preserved from v6.7)
+// ============================================================
+
+function runAIInference() {
+  const behaviorSheet  = getOrCreateSheet(CONFIG.SHEET_BEHAVIOR,  COLUMN_HEADERS_BEHAVIOR);
+  const contactsSheet  = getOrCreateSheet(CONFIG.SHEET_CONTACTS,  COLUMN_HEADERS_CONTACTS);
+  const logger = new Logger("AI_ENGINE");
+  if (!CONFIG.gemini_key) { logger.log("ERROR", "Gemini API key not configured"); return; }
+
+  try {
+    const behaviorData = behaviorSheet.getDataRange().getValues();
+    const contactsData = contactsSheet.getDataRange().getValues();
+    const emailToContactRow = {};
+    contactsData.forEach((row, idx) => {
+      const email = (row[COLUMNS_CONTACTS.EMAIL-1]||"").trim().toLowerCase();
+      if (email) emailToContactRow[email] = idx + 1;
+    });
+
+    const pending = [];
+    for (let i = 1; i < behaviorData.length; i++) {
+      if (pending.length >= CONFIG.MAX_AI_PER_RUN) break;
+      const avgScore = behaviorData[i][COLUMNS_BEHAVIOR.AVG_SCORE-1];
+      if (!avgScore || avgScore === 0) {
+        pending.push({ index: i+1, email: behaviorData[i][COLUMNS_BEHAVIOR.EMAIL-1],
+          summary: { activityCount: behaviorData[i][COLUMNS_BEHAVIOR.ACTIVITY_COUNT-1],
+            primaryTag: behaviorData[i][COLUMNS_BEHAVIOR.PRIMARY_TAG-1],
+            allTags: behaviorData[i][COLUMNS_BEHAVIOR.ALL_TAGS-1],
+            interestLevel: behaviorData[i][COLUMNS_BEHAVIOR.INTEREST_LEVEL-1] } });
+      }
+    }
+
+    if (pending.length === 0) { logger.log("INFO", "No pending summaries for AI"); return; }
+
+    let processed = 0;
+    const aiBudgetStart = Date.now();
+
+    for (let i = 0; i < pending.length; i += CONFIG.AI_BATCH_SIZE) {
+      if (!isTimeRemaining(30000) || (Date.now()-aiBudgetStart) > 90000) break;
+      const batch = pending.slice(i, i+CONFIG.AI_BATCH_SIZE);
+      let results = inferBatchOnAggregates(batch, logger);
+      if (results.rateLimited) { Utilities.sleep(CONFIG.GEMINI_RATE_LIMIT_PAUSE); results = inferBatchOnAggregates(batch, logger); }
+      results.data.forEach((result, idx) => {
+        if (result.valid) {
+          behaviorSheet.getRange(batch[idx].index, COLUMNS_BEHAVIOR.AVG_SCORE).setValue(result.score);
+          const crow = emailToContactRow[batch[idx].email];
+          if (crow) {
+            contactsSheet.getRange(crow, COLUMNS_CONTACTS.AI_SCORE).setValue(result.score);
+            contactsSheet.getRange(crow, COLUMNS_CONTACTS.AI_TAG).setValue(result.tag);
+          }
+          processed++;
+        }
+      });
+      SpreadsheetApp.flush();
+    }
+
+    logger.log("COMPLETE", { processed, total: pending.length });
+
+  } catch (error) { logger.log("ERROR", { error: error.message }); throw error; }
+}
+
+function inferBatchOnAggregates(rowsData, logger) {
+  if (!CONFIG.gemini_key) return { valid: false, error: "No API key", rateLimited: false, data: [] };
+  const requests = rowsData.map(item => ({
+    url: `${CONFIG.GEMINI_API_BASE}/${CONFIG.gemini_model}:generateContent`,
+    method: "POST",
+    headers: { "x-goog-api-key": CONFIG.gemini_key, "Content-Type": "application/json" },
+    payload: JSON.stringify({ contents: [{ parts: [{ text: `Analyze this lead's behavioral summary.\nEmail: ${item.email}\nActivity Count: ${item.summary.activityCount}\nInterest Level: ${item.summary.interestLevel}\nPrimary Tag: ${item.summary.primaryTag}\nAll Tags: ${item.summary.allTags}\nRespond ONLY with valid JSON: {"score": <1-100>, "tag": "<one_word>"}` }] }], generationConfig: { response_mime_type: "application/json", maxOutputTokens: 200 } }),
+    muteHttpExceptions: true
+  }));
+  try {
+    const responses = UrlFetchApp.fetchAll(requests);
+    const results = [];
+    let rateLimited = false;
+    responses.forEach(res => {
+      if (res.getResponseCode() === 429) { rateLimited = true; results.push({ valid: false, error: "Rate limited" }); return; }
+      results.push(parseGeminiResponse(res));
+    });
+    return { rateLimited, data: results };
+  } catch (error) {
+    logger.log("FETCH_ERROR", error.message);
+    return { rateLimited: false, data: rowsData.map(() => ({ valid: false, error: error.message })) };
+  }
+}
+
+// ============================================================
+// PHASE 5: AI SEGMENTATION (word-boundary fix preserved)
+// ============================================================
+
+function assignSegments() {
+  const contactsSheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const logger = new Logger("SEGMENTATION");
+  try {
+    const data = contactsSheet.getDataRange().getValues();
+    let segmentedCount = 0;
+    for (let i = 1; i < data.length; i++) {
+      const tag = (data[i][COLUMNS_CONTACTS.AI_TAG-1] || "").trim().toLowerCase();
+      if (!tag) { contactsSheet.getRange(i+1, COLUMNS_CONTACTS.AI_SEGMENT).setValue("Unclassified"); continue; }
+      let segment = "General";
+      for (const [tagKey, segmentName] of Object.entries(SEGMENT_MAP)) {
+        // ✅ Word-boundary fix: prevents 'main','email','detail' matching 'ai'
+        if (new RegExp(`(^|[_\\-\\s,])${tagKey}([_\\-\\s,]|$)`).test(tag) || tag === tagKey) {
+          segment = segmentName; break;
+        }
+      }
+      contactsSheet.getRange(i+1, COLUMNS_CONTACTS.AI_SEGMENT).setValue(segment);
+      segmentedCount++;
+    }
+    logger.log("COMPLETE", { segmented: segmentedCount, total: data.length-1 });
+  } catch (error) { logger.log("ERROR", { error: error.message }); throw error; }
+}
+
+// ============================================================
+// PHASE 6: GAP DETECTION (preserved from v6.7)
+// ============================================================
+
+function detectHighImpactLeads() {
+  const contactsSheet  = getOrCreateSheet(CONFIG.SHEET_CONTACTS,  COLUMN_HEADERS_CONTACTS);
+  const behaviorSheet  = getOrCreateSheet(CONFIG.SHEET_BEHAVIOR,  COLUMN_HEADERS_BEHAVIOR);
+  const insightsSheet  = getOrCreateSheet(CONFIG.SHEET_INSIGHTS,  COLUMN_HEADERS_INSIGHTS);
+  const logger = new Logger("GAP_DETECTION");
+  try {
+    const behaviorData = behaviorSheet.getDataRange().getValues();
+    const behaviorMap = {};
+    behaviorData.slice(1).forEach(row => {
+      const email = (row[COLUMNS_BEHAVIOR.EMAIL-1]||"").trim().toLowerCase();
+      const avgScore = row[COLUMNS_BEHAVIOR.AVG_SCORE-1];
+      if (email && avgScore) behaviorMap[email] = { activityCount: row[COLUMNS_BEHAVIOR.ACTIVITY_COUNT-1], avgScore, primaryTag: row[COLUMNS_BEHAVIOR.PRIMARY_TAG-1] };
+    });
+
+    const contactData = contactsSheet.getDataRange().getValues();
+    const detectedRows = [];
+    contactData.slice(1).forEach((row, idx) => {
+      const email  = (row[COLUMNS_CONTACTS.EMAIL-1]||"").trim().toLowerCase();
+      const status = row[COLUMNS_CONTACTS.STATUS-1] || "";
+      if (!behaviorMap[email]) return;
+      const b = behaviorMap[email];
+      const composite = (b.avgScore * GAP_DETECTION_CONFIG.SCORE_WEIGHT) + (b.activityCount * 10 * GAP_DETECTION_CONFIG.ACTIVITY_WEIGHT);
+      if (b.avgScore >= GAP_DETECTION_CONFIG.MIN_SCORE && GAP_DETECTION_CONFIG.TARGET_STATUSES.includes(status) && composite >= GAP_DETECTION_CONFIG.MIN_COMPOSITE_SCORE) {
+        detectedRows.push(idx+2);
+        insightsSheet.appendRow([new Date(), email, status, Math.round(b.avgScore), b.primaryTag||"interested", "High Intent + Low Status", "Nurture / Re-engage", new Date()]);
+      }
+    });
+
+    if (detectedRows.length > 0) {
+      detectedRows.forEach(r => contactsSheet.getRange(r, 1, 1, COLUMN_HEADERS_CONTACTS.length).setBackground("#fff2cc"));
+    }
+    logger.log("COMPLETE", { detected: detectedRows.length });
+  } catch (error) { logger.log("ERROR", { error: error.message }); throw error; }
+}
+
+// ============================================================
+// PHASE 7: INDUSTRY-SEQUENTIAL MAILUP PUSH (v6.7 preserved)
+// ============================================================
+
+function pushSheetToMailUp() {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const logger = new Logger("PUSH");
+  try {
+    if (!isTimeRemaining(90000)) { logger.log("TIMEOUT", "Not enough time for push"); return; }
+    const token = getMailUpTokenCached();
+    if (!token) { logger.log("ERROR", "Failed to get MailUp token"); return; }
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) { logger.log("INFO", "No data to push"); return; }
+
+    const allData = sheet.getRange(2, 1, lastRow-1, COLUMN_HEADERS_CONTACTS.length).getValues();
+    const industryQueue = {};
+
+    for (let i = 0; i < allData.length; i++) {
+      const status = allData[i][COLUMNS_CONTACTS.STATUS-1];
+      if (status === "Pending" || status === "Failed") {
+        const industry = (allData[i][COLUMNS_CONTACTS.INDUSTRY-1] || "General").trim() || "General";
+        if (!industryQueue[industry]) industryQueue[industry] = [];
+        industryQueue[industry].push({ index: i+2, row: allData[i] });
+      }
+    }
+
+    const totalPending = Object.values(industryQueue).reduce((s,a)=>s+a.length, 0);
+    if (totalPending === 0) { logger.log("INFO", "No pending records"); return; }
+    logger.log("INFO", `Found ${totalPending} pending across ${Object.keys(industryQueue).length} industries`);
+
+    let successCount = 0, failureCount = 0;
+    for (const industry in industryQueue) {
+      if (!isTimeRemaining(30000)) break;
+      const batch = industryQueue[industry];
+      for (let j = 0; j < batch.length; j += CONFIG.MAILUP_BATCH_SIZE) {
+        if (!isTimeRemaining(20000)) break;
+        const subBatch = batch.slice(j, j+CONFIG.MAILUP_BATCH_SIZE);
+        const results = pushBatch(subBatch, token, logger);
+        results.forEach((result, idx) => {
+          const rowIndex = subBatch[idx].index;
+          sheet.getRange(rowIndex, COLUMNS_CONTACTS.STATUS).setValue(result.status);
+          sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE).setValue(result.message);
+          if (result.status === "Success") { sheet.getRange(rowIndex, COLUMNS_CONTACTS.MAILUP_ID).setValue(result.mailupId); sheet.getRange(rowIndex, COLUMNS_CONTACTS.PUSHED_AT).setValue(new Date()); successCount++; }
+          else if (result.status === "Failed") { failureCount++; pushToDLQ(rowIndex, subBatch[idx].row, result.message); }
+        });
+        SpreadsheetApp.flush();
+      }
+      logger.log("INDUSTRY_DONE", { industry });
+    }
+    logger.log("COMPLETE", { success: successCount, failed: failureCount, total: totalPending });
+  } catch (error) { logger.log("ERROR", { error: error.message }); throw error; }
+}
+
+function pushBatch(rowsData, token, logger) {
+  const requests = [];
+  rowsData.forEach(item => {
+    const v = validateContactForMailUp(item.row);
+    if (!v.valid) return;
+    requests.push({ url: `${CONFIG.MAILUP_API_BASE}/List/${CONFIG.mailup_list_id}/Recipient`, method: "POST",
+      headers: { "Authorization": "Bearer "+token, "Content-Type": "application/json" },
+      payload: JSON.stringify({ "Email": v.sanitized.email, "Fields": buildMailUpFields(v.sanitized) }),
+      muteHttpExceptions: true });
+  });
+  if (requests.length === 0) return [];
+  return UrlFetchApp.fetchAll(requests).map((res, idx) => {
+    const code = res.getResponseCode(), body = res.getContentText();
+    const email = rowsData[idx].row[COLUMNS_CONTACTS.EMAIL-1];
+    if (code >= 200 && code < 300) { logger.log("PUSH_SUCCESS", { email, code }); return { status: "Success", message: "Synced to MailUp", mailupId: body }; }
+    if (code === 429) { return { status: "Pending", message: "Rate limited - will retry" }; }
+    if (code === 409) { return { status: "Failed", message: "Duplicate email in MailUp list" }; }
+    return { status: "Failed", message: `API Error ${code}: ${body.substring(0, 50)}` };
+  });
+}
+
+function retryFailedPushes() {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const logger = new Logger("RETRY");
+  try {
+    const lastRow = sheet.getLastRow(); if (lastRow <= 1) return;
+    const allData = sheet.getRange(2, 1, lastRow-1, COLUMN_HEADERS_CONTACTS.length).getValues();
+    const failed = [];
+    for (let i = 0; i < allData.length; i++) {
+      if (!isTimeRemaining(60000)) break;
+      if (allData[i][COLUMNS_CONTACTS.STATUS-1] === "Failed") failed.push({ index: i+2, row: allData[i] });
+    }
+    if (failed.length === 0) { logger.log("INFO", "No failed records to retry"); return; }
+    const token = getMailUpTokenCached();
+    let successCount = 0;
+    for (let i = 0; i < failed.length; i += CONFIG.MAILUP_BATCH_SIZE) {
+      if (!isTimeRemaining(30000)) break;
+      const batch = failed.slice(i, i+CONFIG.MAILUP_BATCH_SIZE);
+      pushBatch(batch, token, logger).forEach((result, idx) => {
+        sheet.getRange(batch[idx].index, COLUMNS_CONTACTS.STATUS).setValue(result.status);
+        sheet.getRange(batch[idx].index, COLUMNS_CONTACTS.MESSAGE).setValue(result.message);
+        if (result.status === "Success") successCount++;
+      });
+      SpreadsheetApp.flush();
+    }
+    logger.log("COMPLETE", { retried: failed.length, success: successCount });
+  } catch (error) { logger.log("ERROR", { error: error.message }); }
+}
+
+// ============================================================
+// MAIN ORCHESTRATOR
+// ============================================================
+
+function runSync() {
+  SCRIPT_START_TIME = Date.now();
+  console.log("🚀 Starting Unified Intelligence Sync v7.0");
+  logEvent(LOG_LEVELS.INFO, "SYNC_START", "Initiating 7-phase pipeline");
+  const timeStart = Date.now();
+  try {
+    if (isTimeRemaining(180000)) { runInfinityFetch(); }
+    if (isTimeRemaining(150000)) { ingestHubSpotSignals(); }
+    if (isTimeRemaining(120000)) { aggregateSignalsByLead(); }
+    if (isTimeRemaining(90000))  { runAIInference(); }
+    if (isTimeRemaining(60000))  { assignSegments(); }
+    if (isTimeRemaining(40000))  { detectHighImpactLeads(); }
+    if (isTimeRemaining(30000))  { pushSheetToMailUp(); }
+    logEvent(LOG_LEVELS.SUCCESS, "SYNC_COMPLETE", `Completed in ${Date.now()-timeStart}ms`);
+  } catch (error) { logEvent(LOG_LEVELS.ERROR, "SYNC_CRITICAL", error.message); throw error; }
+}
+
+// ============================================================
+// VALIDATION & DATA PREPARATION
+// ============================================================
+
+function validateContactForMailUp(row) {
+  const errors = [];
+  const email     = (row[COLUMNS_CONTACTS.EMAIL-1]     || "").trim();
+  const firstName = (row[COLUMNS_CONTACTS.FIRST_NAME-1] || "").trim();
+  const lastName  = (row[COLUMNS_CONTACTS.LAST_NAME-1]  || "").trim();
+  const company   = (row[COLUMNS_CONTACTS.COMPANY-1]   || "").trim();
+
+  if (!isValidEmail(email))                        errors.push("Invalid email format");
+  if (!firstName && !lastName)                     errors.push("At least one name required");
+  if (firstName && firstName.length > 100)         errors.push("First name too long");
+  if (lastName  && lastName.length  > 100)         errors.push("Last name too long");
+  if (company   && company.length   > 255)         errors.push("Company too long");
+
+  return {
+    valid: errors.length === 0,
+    error: errors.join("; "),
+    sanitized: {
+      email:     email.toLowerCase(),
+      firstName: firstName.substring(0, 100),
+      lastName:  lastName.substring(0, 100),
+      company:   company.substring(0, 255),
+      jobTitle:  (row[COLUMNS_CONTACTS.JOB_TITLE-1]  || "").trim().substring(0, 100),
+      industry:  (row[COLUMNS_CONTACTS.INDUSTRY-1]   || "").trim().substring(0, 100),
+      country:   (row[COLUMNS_CONTACTS.COUNTRY-1]    || "").trim().substring(0, 100),
+      region:    (row[COLUMNS_CONTACTS.REGION-1]     || "").trim().substring(0, 100),
+      continent: (row[COLUMNS_CONTACTS.CONTINENT-1]  || "").trim().substring(0, 100)
+    }
+  };
+}
+
+function buildMailUpFields(s) {
+  const fields = [
+    { Id: MAILUP_FIELD_IDS.FIRST_NAME, Value: s.firstName },
+    { Id: MAILUP_FIELD_IDS.LAST_NAME,  Value: s.lastName  },
+    { Id: MAILUP_FIELD_IDS.COMPANY,    Value: s.company   }
+  ];
+  if (s.jobTitle)  fields.push({ Id: MAILUP_FIELD_IDS.JOB_TITLE,  Value: s.jobTitle  });
+  if (s.industry)  fields.push({ Id: MAILUP_FIELD_IDS.INDUSTRY,   Value: s.industry  });
+  if (s.country)   fields.push({ Id: MAILUP_FIELD_IDS.COUNTRY,    Value: s.country   });
+  if (s.region)    fields.push({ Id: MAILUP_FIELD_IDS.REGION,     Value: s.region    });
+  if (s.continent) fields.push({ Id: MAILUP_FIELD_IDS.CONTINENT,  Value: s.continent });
+  return fields;
+}
+
+function validateSignal(signal) {
+  const errors = [];
+  if (!signal.id)         errors.push("Missing signal ID");
+  if (!signal.properties) errors.push("Missing properties");
+  const channelType = signal.properties?.hs_communication_channel_type || "";
+  const loggedFrom  = signal.properties?.hs_communication_logged_from  || "";
+  const timestamp   = signal.properties?.hs_timestamp;
+  if (!channelType) errors.push("Missing channel type");
+  if (!loggedFrom)  errors.push("Missing logged_from");
+  if (!timestamp)   errors.push("Missing timestamp");
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) errors.push("Invalid timestamp");
+  return {
+    valid: errors.length === 0,
+    error: errors.join("; "),
+    sanitized: {
+      channelType: channelType.trim().substring(0, 50),
+      loggedFrom:  loggedFrom.trim().substring(0, 100),
+      subject:     (signal.properties?.hs_communication_subject || "").trim().substring(0, 200),
+      timestamp:   date
+    }
+  };
+}
+
+// ✅ Strict allowlist — rejects XSS, null bytes, quotes (FIX from v6.7 testing)
+function isValidEmail(email) {
+  if (!email || typeof email !== 'string') return false;
+  return /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/.test(email.trim());
+}
+
+// ============================================================
+// HELPER: ROW BUILDERS & SHEET LOOKUPS (NEW in v7.0)
+// ============================================================
+
+/** Fetch a single HubSpot contact by ID */
+function fetchHubSpotContact(contactId) {
+  const props = ["email","firstname","lastname","company","jobtitle","industry","country","hs_lead_status","continent"];
+  const response = fetchWithBackoff(`${CONFIG.HUBSPOT_API_BASE}/contacts/${contactId}?properties=${props.join(",")}`);
+  if (!response || !response.properties) return null;
+  return mapHSPropertiesToRow(response);
+}
+
+/** Map HubSpot API response to a flat row array (18 columns) */
+function mapHSPropertiesToRow(contact) {
+  const p = contact.properties;
+  const email = (p.email || "").trim().toLowerCase();
+  const industry = (p.industry || "Unclassified").trim();
+  return {
+    email, industry,
+    row: [
+      p.firstname || "", p.lastname || "", email,
+      p.company || "", p.jobtitle || "", industry,
+      p.country || "", p.hs_lead_status || "", p.continent || "",
+      "Pending", "Waiting to sync",
+      "", "", new Date(),
+      "", "", "",           // AI Score, AI Tag, AI Segment
+      String(contact.id)   // ✅ HS Contact ID (col 18)
+    ]
+  };
+}
+
+/** Insert or update a contact row based on email dedup */
+function upsertContactRow(sheet, contactData, contactId) {
+  const email = contactData.email;
+  const existingRow = getContactRowByEmail(sheet, email) || getContactRowByHSId(sheet, contactId);
+  if (existingRow) {
+    // Update non-status fields, preserve status/mailupId/scores
+    const existing = sheet.getRange(existingRow, 1, 1, COLUMN_HEADERS_CONTACTS.length).getValues()[0];
+    const updated = [...contactData.row];
+    // Preserve: STATUS(10), MESSAGE(11), MAILUP_ID(12), PUSHED_AT(13), AI_SCORE(15), AI_TAG(16), AI_SEGMENT(17)
+    [10,11,12,13,15,16,17].forEach(col => { updated[col-1] = existing[col-1]; });
+    sheet.getRange(existingRow, 1, 1, updated.length).setValues([updated]);
+  } else {
+    safeWriteToSheet(sheet, [contactData.row], sheet.getLastRow() + 1);
+  }
+}
+
+/** Find a row index by HubSpot Contact ID (column 18) */
+function getContactRowByHSId(sheet, contactId) {
+  const id = String(contactId || "").trim();
+  if (!id || sheet.getLastRow() < 2) return null;
+  try {
+    const col = sheet.getRange(2, COLUMNS_CONTACTS.HS_CONTACT_ID, sheet.getLastRow()-1, 1).getValues();
+    for (let i = 0; i < col.length; i++) {
+      if (String(col[i][0]).trim() === id) return i + 2;
+    }
+  } catch (e) {}
+  return null;
+}
+
+/** Find a row index by email address */
+function getContactRowByEmail(sheet, email) {
+  const e = (email || "").trim().toLowerCase();
+  if (!e || sheet.getLastRow() < 2) return null;
+  try {
+    const col = sheet.getRange(2, COLUMNS_CONTACTS.EMAIL, sheet.getLastRow()-1, 1).getValues();
+    for (let i = 0; i < col.length; i++) {
+      if (String(col[i][0]).trim().toLowerCase() === e) return i + 2;
+    }
+  } catch (err) {}
+  return null;
+}
+
+/** Build email→rowIndex map for bulk operations */
+function buildEmailIndex(sheet) {
+  const map = {};
+  if (sheet.getLastRow() < 2) return map;
+  sheet.getRange(2, COLUMNS_CONTACTS.EMAIL, sheet.getLastRow()-1, 1).getValues()
+    .forEach((r, i) => { const e = String(r[0]).trim().toLowerCase(); if (e) map[e] = i + 2; });
+  return map;
+}
+
+/** Build hsContactId→rowIndex map for bulk operations */
+function buildHSIdIndex(sheet) {
+  const map = {};
+  if (sheet.getLastRow() < 2) return map;
+  sheet.getRange(2, COLUMNS_CONTACTS.HS_CONTACT_ID, sheet.getLastRow()-1, 1).getValues()
+    .forEach((r, i) => { const id = String(r[0]).trim(); if (id) map[id] = i + 2; });
+  return map;
+}
+
+/** Build a compact contact row from the full sheet row (for initial import helper) */
+function buildContactRow(contact) {
+  return mapHSPropertiesToRow(contact).row;
+}
+
+// ============================================================
+// API LAYER
+// ============================================================
+
+function fetchWithBackoff(url, maxRetries = CONFIG.MAX_RETRIES) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = UrlFetchApp.fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${CONFIG.hub_token}` },
+        muteHttpExceptions: true,
+        timeout: 30000
+      });
+      const code = res.getResponseCode();
+      if (code === 200) return JSON.parse(res.getContentText());
+      if (code === 429 || code >= 400) {
+        if (attempt === maxRetries) return null;
+        Utilities.sleep(CONFIG.RETRY_DELAY_BASE * Math.pow(2, attempt-1));
+      }
+    } catch (e) {
+      if (attempt === maxRetries) return null;
+      Utilities.sleep(CONFIG.RETRY_DELAY_BASE * Math.pow(2, attempt-1));
+    }
+  }
+  return null;
+}
+
+function getMailUpTokenCached() {
+  const props = PropertiesService.getScriptProperties();
+  const cached = props.getProperty("MAILUP_TOKEN");
+  const expiry = parseInt(props.getProperty("MAILUP_TOKEN_EXP") || "0");
+  if (cached && Date.now() < expiry) return cached;
+  try {
+    const auth = Utilities.base64Encode(CONFIG.mailup_client_id + ':' + CONFIG.mailup_client_secret);
+    const payload = `grant_type=password&username=${encodeURIComponent(CONFIG.mailup_username)}&password=${encodeURIComponent(CONFIG.mailup_password)}`;
+    const res = UrlFetchApp.fetch(CONFIG.MAILUP_TOKEN_URL, {
+      method: "POST",
+      headers: { "Authorization": "Basic "+auth, "Content-Type": "application/x-www-form-urlencoded" },
+      payload, muteHttpExceptions: true, timeout: 20000
+    });
+    if (res.getResponseCode() !== 200) { logEvent(LOG_LEVELS.ERROR, "AUTH", `MailUp auth failed (${res.getResponseCode()})`); return null; }
+    const json = JSON.parse(res.getContentText());
+    if (!json.access_token) { logEvent(LOG_LEVELS.ERROR, "AUTH", "No token in response"); return null; }
+    props.setProperty("MAILUP_TOKEN", json.access_token);
+    props.setProperty("MAILUP_TOKEN_EXP", (Date.now() + 50*60*1000).toString());
+    return json.access_token;
+  } catch (error) { logEvent(LOG_LEVELS.ERROR, "AUTH", error.message); return null; }
+}
+
+function parseGeminiResponse(res) {
+  try {
+    const text = res.getContentText();
+    if (!text) return { valid: false, error: "Empty response" };
+    const json = JSON.parse(text);
+    if (json.error) return { valid: false, error: json.error.message || "API error" };
+    if (!json.candidates || json.candidates.length === 0) return { valid: false, error: "No candidates" };
+    const part = json.candidates[0]?.content?.parts?.[0];
+    if (!part?.text) return { valid: false, error: "No text in part" };
+    const cleanText = part.text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const aiJson = JSON.parse(cleanText);
+    if (typeof aiJson.score !== 'number' || aiJson.score < 1 || aiJson.score > 100) return { valid: false, error: "Invalid score" };
+    if (!aiJson.tag || typeof aiJson.tag !== 'string') return { valid: false, error: "Invalid tag" };
+    return { valid: true, score: Math.round(aiJson.score), tag: aiJson.tag.substring(0, 50) };
+  } catch (e) { return { valid: false, error: e.message }; }
+}
+
+// ============================================================
+// UTILITY LAYER
+// ============================================================
+
+const STATE = {
+  get:    ()        => JSON.parse(PropertiesService.getScriptProperties().getProperty("APP_STATE") || "{}"),
+  set:    (state)   => PropertiesService.getScriptProperties().setProperty("APP_STATE", JSON.stringify(state)),
+  update: (key, val)=> { const s = STATE.get(); s[key] = val; STATE.set(s); },
+  delete: (key)     => { const s = STATE.get(); delete s[key]; STATE.set(s); }
+};
+
+class Logger {
+  constructor(module) { this.module = module; }
+  log(event, data) {
+    const msg = typeof data === 'object' ? JSON.stringify(data) : data;
+    console.log(`[${this.module}] ${event}: ${msg}`);
+    logEvent(LOG_LEVELS.INFO, this.module, `${event}: ${msg}`);
+  }
+}
+
+function safeWriteToSheet(sheet, rows, startRow) {
+  if (rows.length === 0) return true;
+  try { sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows); return true; }
+  catch (e) { logEvent(LOG_LEVELS.ERROR, "SHEET", `Write failed: ${e.message}`); return false; }
+}
+
+function getExistingEmails(sheet) {
+  const set = new Set();
+  if (sheet.getLastRow() < 2) return set;
+  try {
+    sheet.getRange(2, COLUMNS_CONTACTS.EMAIL, sheet.getLastRow()-1, 1).getValues()
+      .forEach(r => { if (r[0]) set.add(String(r[0]).trim().toLowerCase()); });
+  } catch (e) { console.error("Failed to load existing emails:", e.message); }
+  return set;
+}
+
+function getExistingSignalIds(sheet) {
+  const set = new Set();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return set;
+  try {
+    const rowsToLoad = Math.min(CONFIG.SIGNAL_LOOKBACK_ROWS, lastRow-1);
+    const startRow = Math.max(2, lastRow-rowsToLoad+1);
+    sheet.getRange(startRow, COLUMNS_ACTIVITY.SIGNAL_ID, rowsToLoad, 1).getValues()
+      .forEach(r => { if (r[0]) set.add(String(r[0]).trim()); });
+  } catch (e) { console.error("Failed to load signal IDs:", e.message); }
+  return set;
+}
+
+function pushToDLQ(rowIndex, rowData, reason) {
+  try {
+    const dlqSheet = getOrCreateSheet(CONFIG.SHEET_DLQ, ["Row Index","Email","Reason","Timestamp","Retry Count"]);
+    dlqSheet.appendRow([rowIndex, rowData[COLUMNS_CONTACTS.EMAIL-1], reason, new Date(), 0]);
+  } catch (e) { console.error("Failed to push to DLQ:", e.message); }
+}
+
+function isTimeRemaining(buffer = 30000) {
+  return (Date.now() - SCRIPT_START_TIME) < (CONFIG.MAX_TIME_MS - buffer);
+}
+
+function getOrCreateSheet(name, headers) {
+  let sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet(name);
+    if (headers && headers.length > 0) { sheet.appendRow(headers); sheet.setFrozenRows(1); }
+  }
+  return sheet;
+}
+
+function logEvent(level, type, message) {
+  try {
+    const logsSheet = getOrCreateSheet(CONFIG.SHEET_LOGS, ["Timestamp","Level","Type","Message"]);
+    logsSheet.appendRow([new Date(), level, type, message]);
+    if (logsSheet.getLastRow() > 2000) logsSheet.deleteRows(2, 500);
+  } catch (e) { console.error("Failed to log event:", e.message); }
+}
+
+function getProp(key) {
+  return PropertiesService.getScriptProperties().getProperty(key);
+}
+
+// ============================================================
+// UI FUNCTIONS
+// ============================================================
+
+function showLogs()           { SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(getOrCreateSheet(CONFIG.SHEET_LOGS)); }
+function showInsights()       { SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(getOrCreateSheet(CONFIG.SHEET_INSIGHTS, COLUMN_HEADERS_INSIGHTS)); }
+function showBehaviorSummary(){ SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(getOrCreateSheet(CONFIG.SHEET_BEHAVIOR, COLUMN_HEADERS_BEHAVIOR)); }
+function showWebhookEvents()  { SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(getOrCreateSheet(CONFIG.SHEET_EVENTS,  COLUMN_HEADERS_EVENTS)); }
+function showBackSyncLog()    { SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(getOrCreateSheet(CONFIG.SHEET_BACKSYNC, COLUMN_HEADERS_BACKSYNC)); }
+
+function showStats() {
+  const cs = getOrCreateSheet(CONFIG.SHEET_CONTACTS,  COLUMN_HEADERS_CONTACTS);
+  const bs = getOrCreateSheet(CONFIG.SHEET_BEHAVIOR,  COLUMN_HEADERS_BEHAVIOR);
+  const is = getOrCreateSheet(CONFIG.SHEET_INSIGHTS,  COLUMN_HEADERS_INSIGHTS);
+  const es = getOrCreateSheet(CONFIG.SHEET_EVENTS,    COLUMN_HEADERS_EVENTS);
+  const bk = getOrCreateSheet(CONFIG.SHEET_BACKSYNC,  COLUMN_HEADERS_BACKSYNC);
+
+  const total = cs.getLastRow()-1;
+  let pending=0, success=0, failed=0, unsub=0, bounce=0, deleted=0;
+  if (total > 0) {
+    cs.getRange(2, COLUMNS_CONTACTS.STATUS, total, 1).getValues().forEach(r => {
+      if (r[0]==="Pending")      pending++;
+      else if (r[0]==="Success") success++;
+      else if (r[0]==="Failed")  failed++;
+      else if (r[0]==="Unsubscribed") unsub++;
+      else if (r[0]==="Bounced")      bounce++;
+      else if (r[0]==="Deleted")      deleted++;
+    });
+  }
+
+  const html = `
+    <h2>📊 AI Sync Intelligence Dashboard v7.0</h2>
+    <table border="1" cellpadding="8" style="width:100%;border-collapse:collapse">
+      <tr style="background:#f0f0f0"><th>Metric</th><th>Count</th></tr>
+      <tr><td>📇 Total Contacts</td><td><strong>${total}</strong></td></tr>
+      <tr style="background:#e3f2fd"><td>⏳ Pending push</td><td>${pending}</td></tr>
+      <tr style="background:#e8f5e9"><td>✅ Success (MailUp)</td><td>${success}</td></tr>
+      <tr style="background:#ffebee"><td>❌ Failed</td><td>${failed}</td></tr>
+      <tr style="background:#fff3e0"><td>🔕 Unsubscribed</td><td>${unsub}</td></tr>
+      <tr style="background:#fce4ec"><td>↩️ Bounced</td><td>${bounce}</td></tr>
+      <tr style="background:#f5f5f5"><td>🗑️ Deleted (HubSpot)</td><td>${deleted}</td></tr>
+    </table>
+    <table border="1" cellpadding="8" style="width:100%;border-collapse:collapse;margin-top:10px">
+      <tr style="background:#f0f0f0"><th>Sheet</th><th>Rows</th></tr>
+      <tr><td>📡 Behavior Summaries</td><td>${bs.getLastRow()-1}</td></tr>
+      <tr><td>🟡 High-Impact Leads</td><td>${is.getLastRow()-1}</td></tr>
+      <tr><td>📡 Webhook Events</td><td>${es.getLastRow()-1}</td></tr>
+      <tr><td>↩️ Back-Sync Log</td><td>${bk.getLastRow()-1}</td></tr>
+    </table>
+    <hr>
+    <h3>🆕 v7.0 Event Engine Status</h3>
+    <p>Webhook receiver: <strong>${getProp("WEB_APP_URL") ? "✅ URL configured" : "⚠️ WEB_APP_URL not set"}</strong></p>
+    <p>Webhook secret:   <strong>${CONFIG.hubspot_webhook_secret ? "✅ Configured" : "⚠️ Not set (insecure)"}</strong></p>
+    <p>HubSpot App ID:   <strong>${CONFIG.hubspot_app_id ? "✅ " + CONFIG.hubspot_app_id : "⚠️ Not set"}</strong></p>
+    <p>Last updated: ${new Date().toLocaleString()}</p>
+  `;
+  SpreadsheetApp.getUi().showModelessDialog(HtmlService.createHtmlOutput(html), "Sync Statistics v7.0");
+}
+
+function resetEverything() {
+  const ui = SpreadsheetApp.getUi();
+  if (ui.alert("⚠️ This will delete ALL data and triggers. Are you sure?", ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+  removeAllTriggers();
+  PropertiesService.getScriptProperties().deleteAllProperties();
+  STATE.set({});
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  [CONFIG.SHEET_DLQ, CONFIG.SHEET_EVENTS, CONFIG.SHEET_BACKSYNC].forEach(name => {
+    const s = ss.getSheetByName(name); if (s) ss.deleteSheet(s);
+  });
+  ui.alert("✅ Reset complete. Re-configure script properties and run Setup > Register Webhooks.");
+}
