@@ -5,7 +5,7 @@
 
 const vm = require('vm');
 const fs = require('fs');
-let src = fs.readFileSync('/home/claude/v71.js', 'utf8');
+let src = fs.readFileSync('/home/claude/v72.js', 'utf8');
 
 // ─── zero-dep test framework ───────────────────────────────
 let passed=0, failed=0, warned=0;
@@ -104,7 +104,8 @@ src += `\nvar _EXPORTS = {
   processHubSpotWebhookBatch, handleContactCreate, handleContactUpdate,
   handleContactDelete, getProcessedEventIds, saveProcessedEventIds,
   checkBackSyncAlreadyDone, updateHubSpotContact,
-  verifyHubSpotSignature
+  verifyHubSpotSignature,
+  pushLocalChangeToHubSpot, pushSelectedRowToHubSpot, onEdit
 };\n`;
 
 const ctx={
@@ -131,6 +132,13 @@ const {
   handleContactDelete, getProcessedEventIds, saveProcessedEventIds,
   checkBackSyncAlreadyDone
 } = ctx._EXPORTS;
+
+// Bind new v7.2 functions onto ctx so tests can call them as ctx.fnName()
+ctx.pushLocalChangeToHubSpot = ctx._EXPORTS.pushLocalChangeToHubSpot;
+ctx.pushSelectedRowToHubSpot = ctx._EXPORTS.pushSelectedRowToHubSpot;
+ctx.onEdit                   = ctx._EXPORTS.onEdit;
+ctx.syncMailUpToSheets       = ctx._EXPORTS.syncMailUpToSheets || ctx.syncMailUpToSheets;
+ctx.syncSheetsToHubSpot      = ctx._EXPORTS.syncSheetsToHubSpot || ctx.syncSheetsToHubSpot;
 
 // helpers
 function makeContactRow(overrides={}){
@@ -877,6 +885,232 @@ test("Stress","Circular buffer holds after 400+ events processed",()=>{
 });
 
 // ════════════════════════════════════════════════════════════
+section("SUITE 23: pushLocalChangeToHubSpot — core behaviour");
+// ════════════════════════════════════════════════════════════
+
+// Helper: reset UrlFetchApp to succeed for PATCH calls
+function mockPatchSuccess(){
+  ctx.UrlFetchApp = {
+    fetch: () => ({ getResponseCode:()=>200, getContentText:()=>'{}' }),
+    fetchAll:(reqs)=>reqs.map(()=>({getResponseCode:()=>200,getContentText:()=>'{}'}))
+  };
+}
+function mockPatchFailure(){
+  ctx.UrlFetchApp = {
+    fetch: () => ({ getResponseCode:()=>500, getContentText:()=>'{"status":"error"}' }),
+    fetchAll:(reqs)=>reqs.map(()=>({getResponseCode:()=>500,getContentText:()=>'{}'}))
+  };
+}
+
+test("pushLocalChange","Skips row silently when HS_CONTACT_ID is missing",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId: "" }); // no contact ID
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  mockPatchSuccess();
+  // Should complete without error and WITHOUT calling fetch
+  let fetchCalled = false;
+  ctx.UrlFetchApp = { fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[] };
+  ctx.pushLocalChangeToHubSpot(2);
+  assert(!fetchCalled, "fetch should NOT be called when HS_CONTACT_ID is missing");
+});
+
+test("pushLocalChange","Sends PATCH with correct fields",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ firstName:"Alice", lastName:"Smith", company:"Acme", industry:"Tech", hsId:"hs_patch_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let capturedPayload = null;
+  ctx.UrlFetchApp = {
+    fetch: (url, opts) => { capturedPayload = JSON.parse(opts.payload); return { getResponseCode:()=>200, getContentText:()=>'{}' }; },
+    fetchAll:()=>[]
+  };
+  ctx.pushLocalChangeToHubSpot(2);
+  assert(capturedPayload !== null, "fetch should have been called");
+  assertEqual(capturedPayload.properties.firstname, "Alice");
+  assertEqual(capturedPayload.properties.lastname,  "Smith");
+  assertEqual(capturedPayload.properties.company,   "Acme");
+  assertEqual(capturedPayload.properties.industry,  "Tech");
+});
+
+test("pushLocalChange","Uses PATCH method (not POST)",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId:"hs_method_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let capturedMethod = null;
+  ctx.UrlFetchApp = {
+    fetch: (url, opts) => { capturedMethod = opts.method; return { getResponseCode:()=>200, getContentText:()=>'{}' }; },
+    fetchAll:()=>[]
+  };
+  ctx.pushLocalChangeToHubSpot(2);
+  assertEqual(capturedMethod, "PATCH");
+});
+
+test("pushLocalChange","Uses correct HubSpot contact URL",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId:"hs_url_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let capturedUrl = null;
+  ctx.UrlFetchApp = {
+    fetch: (url, opts) => { capturedUrl = url; return { getResponseCode:()=>200, getContentText:()=>'{}' }; },
+    fetchAll:()=>[]
+  };
+  ctx.pushLocalChangeToHubSpot(2);
+  assert(capturedUrl && capturedUrl.includes("hs_url_001"), `URL should contain contact ID, got: ${capturedUrl}`);
+});
+
+test("pushLocalChange","On success: Message cell stamped with confirmation",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId:"hs_stamp_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  mockPatchSuccess();
+  ctx.pushLocalChangeToHubSpot(2);
+  const message = _sheets["Contacts"]._data[1][COLUMNS_CONTACTS.MESSAGE - 1];
+  assert(String(message).includes("Pushed to HubSpot"), `Expected confirmation in Message, got: "${message}"`);
+});
+
+test("pushLocalChange","On failure: Message cell shows error indicator",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId:"hs_fail_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  mockPatchFailure();
+  ctx.pushLocalChangeToHubSpot(2);
+  const message = _sheets["Contacts"]._data[1][COLUMNS_CONTACTS.MESSAGE - 1];
+  assert(String(message).includes("failed") || String(message).includes("❌"),
+    `Expected failure indicator in Message, got: "${message}"`);
+});
+
+test("pushLocalChange","Rejects row with invalid email before pushing",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ email:"not-an-email", hsId:"hs_bademail_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let fetchCalled = false;
+  ctx.UrlFetchApp = { fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[] };
+  ctx.pushLocalChangeToHubSpot(2);
+  assert(!fetchCalled, "Should NOT call HubSpot when email is invalid");
+  const message = _sheets["Contacts"]._data[1][COLUMNS_CONTACTS.MESSAGE - 1];
+  assert(String(message).includes("invalid email"), `Expected invalid email message, got: "${message}"`);
+});
+
+test("pushLocalChange","Acquires and releases lock",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId:"hs_lock_p01" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  mockPatchSuccess();
+  ctx.pushLocalChangeToHubSpot(2);
+  assert(_lockCallCount  >= 1, `Lock should be acquired, calls=${_lockCallCount}`);
+  assert(_lockReleaseCount >= 1, `Lock should be released, releases=${_lockReleaseCount}`);
+});
+
+test("pushLocalChange","Releases lock even when HubSpot PATCH throws",()=>{
+  resetLockCounters();
+  const row = makeContactRow({ hsId:"hs_throw_001" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  ctx.UrlFetchApp = { fetch:()=>{ throw new Error("Network error"); }, fetchAll:()=>[] };
+  try { ctx.pushLocalChangeToHubSpot(2); } catch(e){}
+  assert(_lockReleaseCount >= 1, `Lock must be released on exception, releases=${_lockReleaseCount}`);
+});
+
+// ════════════════════════════════════════════════════════════
+section("SUITE 24: onEdit — column filtering and debounce");
+// ════════════════════════════════════════════════════════════
+
+function makeFakeEditEvent(col, row, sheetName){
+  return {
+    range: {
+      getColumn: ()=>col,
+      getRow:    ()=>row,
+      getSheet:  ()=>({ getName:()=>sheetName||CONFIG.SHEET_CONTACTS })
+    }
+  };
+}
+
+test("onEdit","Ignored when wrong sheet",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R5"];
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, makeContactRow({hsId:"hs_oe1"})]);
+  mockPatchSuccess();
+  let fetchCalled=false;
+  ctx.UrlFetchApp={fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(1, 2, "Some Other Sheet"));
+  assert(!fetchCalled, "Should not push when sheet is not Contacts");
+});
+
+test("onEdit","Ignored when header row edited (row 1)",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R1"];
+  mockPatchSuccess();
+  let fetchCalled=false;
+  ctx.UrlFetchApp={fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(1, 1, CONFIG.SHEET_CONTACTS)); // row 1 = header
+  assert(!fetchCalled, "Should not push when header row is edited");
+});
+
+test("onEdit","Ignored when untracked column edited (e.g. Status col 10)",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R3"];
+  mockPatchSuccess();
+  let fetchCalled=false;
+  ctx.UrlFetchApp={fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(COLUMNS_CONTACTS.STATUS, 3, CONFIG.SHEET_CONTACTS));
+  assert(!fetchCalled, "Status column (col 10) should not trigger push");
+});
+
+test("onEdit","Fires when First Name column edited",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R2"];
+  const row = makeContactRow({ hsId:"hs_onedit_fn" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let fetchCalled=false;
+  ctx.UrlFetchApp={fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(COLUMNS_CONTACTS.FIRST_NAME, 2, CONFIG.SHEET_CONTACTS));
+  assert(fetchCalled, "Editing First Name should trigger a HubSpot push");
+});
+
+test("onEdit","Fires when Company column edited",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R2"];
+  const row = makeContactRow({ hsId:"hs_onedit_co" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let fetchCalled=false;
+  ctx.UrlFetchApp={fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(COLUMNS_CONTACTS.COMPANY, 2, CONFIG.SHEET_CONTACTS));
+  assert(fetchCalled, "Editing Company should trigger a HubSpot push");
+});
+
+test("onEdit","Fires when Industry column edited",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R2"];
+  const row = makeContactRow({ hsId:"hs_onedit_in" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let fetchCalled=false;
+  ctx.UrlFetchApp={fetch:()=>{fetchCalled=true;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(COLUMNS_CONTACTS.INDUSTRY, 2, CONFIG.SHEET_CONTACTS));
+  assert(fetchCalled, "Editing Industry should trigger a HubSpot push");
+});
+
+test("onEdit","Debounce: second call within 2s is suppressed",()=>{
+  resetLockCounters();
+  delete _scriptProps["EDIT_DEBOUNCE_R2"]; // clear any stale debounce key for row 2
+  const row = makeContactRow({ hsId:"hs_debounce" });
+  _sheets["Contacts"] = createMockSheet("Contacts",[COLUMN_HEADERS_CONTACTS, row]);
+  let callCount=0;
+  ctx.UrlFetchApp={fetch:()=>{callCount++;return{getResponseCode:()=>200,getContentText:()=>'{}'}},fetchAll:()=>[]};
+  ctx.onEdit(makeFakeEditEvent(COLUMNS_CONTACTS.FIRST_NAME, 2, CONFIG.SHEET_CONTACTS)); // first — fires
+  ctx.onEdit(makeFakeEditEvent(COLUMNS_CONTACTS.FIRST_NAME, 2, CONFIG.SHEET_CONTACTS)); // second — debounced
+  assertEqual(callCount, 1, `Expected 1 fetch call (debounced), got ${callCount}`);
+});
+
+test("onEdit","Does not throw on null event",()=>{
+  // onEdit must never surface errors to the user
+  ctx.onEdit(null);
+  assert(true, "Should handle null event gracefully");
+});
+
+test("onEdit","Does not throw on empty event",()=>{
+  ctx.onEdit({});
+  assert(true, "Should handle empty event gracefully");
+});
+
+// ════════════════════════════════════════════════════════════
 // FINAL REPORT
 // ════════════════════════════════════════════════════════════
 
@@ -886,7 +1120,7 @@ const warnOnly=results.filter(r=>r.status==="WARN");
 
 console.log(`
 ${"═".repeat(62)}
-  FINAL TEST REPORT — hubspot_mailup_v7.1.js
+  FINAL TEST REPORT — hubspot_mailup_v7.2.js
 ${"═".repeat(62)}
   Total Tests : ${total}
   ✅ Passed   : ${passed}
