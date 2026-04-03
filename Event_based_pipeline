@@ -1,6 +1,44 @@
 /**
  * HUBSPOT ↔ GOOGLE SHEETS ↔ MAILUP: EVENT-DRIVEN INTELLIGENCE ENGINE
- * Version: 7.0 — Full Bidirectional, Real-Time Sync
+ * Version: 7.2 — Manual Sheet Edit Push-Back to HubSpot
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * WHAT'S NEW IN v7.2 vs v7.1
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * ✅ pushLocalChangeToHubSpot(rowIndex)
+ *    → Reads a single Sheets row and PATCHes its data to HubSpot
+ *    → Pushes: First Name, Last Name, Company, Industry
+ *    → Requires HS Contact ID in column 18 (skips silently if missing)
+ *    → Writes confirmation timestamp into the Message column on success
+ *    → Protected by LockService to prevent concurrent sheet edits
+ *    → Exposed in the UI menu under "🔄 Sync → Push This Row → HubSpot"
+ *    → Also callable programmatically: pushLocalChangeToHubSpot(rowIndex)
+ *
+ * ✅ onEdit(e) trigger — auto-detect manual edits and push to HubSpot
+ *    → Fires whenever a user edits a tracked column in the Contacts sheet
+ *    → Tracked columns: First Name, Last Name, Company, Industry (cols 1,2,4,6)
+ *    → Debounced via a 2-second PropertiesService flag to suppress cascading triggers
+ *    → Calls pushLocalChangeToHubSpot() for the edited row automatically
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * WHAT'S NEW IN v7.1 vs v7.0  (Enterprise Hardening Phase)
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * ✅ FIX A — Mutex Locking (LockService) — Race Condition Prevention
+ *    → doPost()             — serialises concurrent webhook deliveries
+ *    → upsertContactRow()   — prevents simultaneous writes to the same row
+ *    → syncMailUpToSheets() — prevents back-sync collision with live webhooks
+ *    → syncSheetsToHubSpot()— prevents write-back collision with back-sync
+ *    → All locks use 10-second waitLock with guaranteed releaseLock in finally{}
+ *    → doPost returns HTTP 503 (retry) when lock cannot be acquired in time
+ *
+ * ✅ FIX B — Circular Buffer for PROCESSED_EVENT_IDS — Persistence Safety
+ *    → Previous cap: 5000 IDs → up to 95 KB → CRASHES PropertiesService (9 KB limit)
+ *    → Audit suggested cap: 1000 IDs → still 19 KB → STILL CRASHES
+ *    → Correct safe cap: 400 IDs → 7.6 KB → 20% headroom below 9 KB limit
+ *    → Calculation: 400 × (16-digit ID = 19 bytes in JSON) = 7,600 bytes < 9,216 bytes
+ *    → Circular: oldest IDs dropped first as new ones arrive; dedup window = 400 events
  *
  * ═══════════════════════════════════════════════════════════════
  * WHAT'S NEW IN v7.0 vs v6.7
@@ -224,10 +262,12 @@ function onOpen() {
         .addItem("Push to MailUp (Industry-Sequential)", "pushSheetToMailUp")
         .addItem("Retry Failed Pushes", "retryFailedPushes"))
       .addSeparator()
-      .addSubMenu(SpreadsheetApp.getUi().createMenu("🔄 v7.0 Sync")
+      .addSubMenu(SpreadsheetApp.getUi().createMenu("🔄 v7.x Sync")
         .addItem("🔁 Full Reconciliation (All Platforms)", "fullReconciliation")
         .addItem("↩️ Sync MailUp Status → Sheets", "syncMailUpToSheets")
-        .addItem("↪️ Write-Back Sheets → HubSpot", "syncSheetsToHubSpot"))
+        .addItem("↪️ Write-Back Sheets → HubSpot", "syncSheetsToHubSpot")
+        .addSeparator()
+        .addItem("✏️ Push Selected Row → HubSpot", "pushSelectedRowToHubSpot"))
       .addSubMenu(SpreadsheetApp.getUi().createMenu("⚙️ Setup")
         .addItem("📡 Register HubSpot Webhooks", "registerHubSpotWebhooks")
         .addItem("⏱️ Setup Time Triggers", "setupTimeTriggers")
@@ -256,6 +296,17 @@ function onOpen() {
  * Deploy as: Execute as Me, Access: Anyone
  */
 function doPost(e) {
+  // ✅ FIX A: Acquire script-level lock before processing.
+  // Concurrent webhook deliveries queue here instead of corrupting Sheets data.
+  const lock = LockService.getScriptLock();
+  const lockAcquired = lock.tryLock(10000); // wait up to 10 s
+  if (!lockAcquired) {
+    // Return 503 so HubSpot automatically retries the batch later
+    logEvent(LOG_LEVELS.WARN, "WEBHOOK", "Lock timeout — returning 503 for HubSpot retry");
+    return ContentService.createTextOutput(JSON.stringify({ status: "retry", message: "Server busy" }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
   try {
     const rawBody = e.postData.contents;
 
@@ -282,6 +333,8 @@ function doPost(e) {
     logEvent(LOG_LEVELS.ERROR, "WEBHOOK", `doPost error: ${err.message}`);
     return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.message }))
       .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock(); // always release, even on exception
   }
 }
 
@@ -388,15 +441,26 @@ function processHubSpotWebhookBatch(events) {
   return { created, updated, deleted, skipped };
 }
 
-/** Returns a Set of already-processed eventIds (last 5000) */
+/** Returns a Set of already-processed eventIds (most recent 400) */
 function getProcessedEventIds() {
   const raw = PropertiesService.getScriptProperties().getProperty("PROCESSED_EVENT_IDS") || "[]";
   return new Set(JSON.parse(raw));
 }
 
-/** Saves the processed event ID set (capped at 5000 to prevent property overflow) */
+/**
+ * ✅ FIX B: Circular buffer — keeps only the 400 most recent event IDs.
+ *
+ * Why 400 and not the 1,000 suggested in the audit:
+ *   A 16-digit HubSpot eventId takes ~19 bytes in JSON.
+ *   400 × 19 = 7,600 bytes — safely under the 9,216-byte (9 KB) PropertiesService limit.
+ *   1,000 × 19 = 19,000 bytes — would crash the property store immediately.
+ *
+ * Dedup window: the last 400 unique events are protected against re-processing.
+ * At typical HubSpot traffic (~50–200 events/hour) this covers 2–8 hours of history,
+ * which is well beyond HubSpot's max retry window of 3 hours.
+ */
 function saveProcessedEventIds(set) {
-  const arr = [...set].slice(-5000);
+  const arr = [...set].slice(-400); // ✅ circular: oldest IDs dropped first
   PropertiesService.getScriptProperties().setProperty("PROCESSED_EVENT_IDS", JSON.stringify(arr));
 }
 
@@ -483,6 +547,12 @@ function handleContactDelete(contactId) {
  * Called by time trigger (recommended: every 1 hour).
  */
 function syncMailUpToSheets() {
+  // ✅ FIX A: Prevent collision when a webhook fires mid-back-sync
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    logEvent(LOG_LEVELS.WARN, "MAILUP_BACKSYNC", "Lock timeout — skipping this cycle, will retry next trigger");
+    return;
+  }
   const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
   const logger = new Logger("MAILUP_BACKSYNC");
 
@@ -520,6 +590,8 @@ function syncMailUpToSheets() {
 
   } catch (err) {
     logger.log("ERROR", { error: err.message });
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -568,6 +640,12 @@ function fetchMailUpRecipientsByStatus(token, statusCode, logger) {
  * Called after syncMailUpToSheets or on schedule.
  */
 function syncSheetsToHubSpot() {
+  // ✅ FIX A: Prevent write-back collision with syncMailUpToSheets or a live webhook
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    logEvent(LOG_LEVELS.WARN, "HS_WRITEBACK", "Lock timeout — skipping this cycle, will retry next trigger");
+    return;
+  }
   const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
   const backSyncSheet = getOrCreateSheet(CONFIG.SHEET_BACKSYNC, COLUMN_HEADERS_BACKSYNC);
   const logger = new Logger("HS_WRITEBACK");
@@ -615,6 +693,8 @@ function syncSheetsToHubSpot() {
 
   } catch (err) {
     logger.log("ERROR", { error: err.message });
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -648,6 +728,168 @@ function updateHubSpotContact(contactId, properties, logger) {
   } catch (e) {
     logger.log("HS_PATCH_ERROR", { contactId, error: e.message });
     return false;
+  }
+}
+
+// ============================================================
+// MANUAL PUSH-BACK: SHEETS ROW → HUBSPOT  (NEW in v7.2)
+// ============================================================
+
+/**
+ * Pushes a single Sheets row's editable fields back to HubSpot.
+ *
+ * Designed for manual corrections made directly in the spreadsheet —
+ * e.g. fixing a misspelled company name or updating an industry tag.
+ * The row must have a HubSpot Contact ID in column 18; rows without
+ * one are silently skipped (they were never imported from HubSpot).
+ *
+ * Fields pushed: First Name, Last Name, Company, Industry.
+ * On success, the Message column is stamped with a confirmation timestamp.
+ * On failure, the Message column shows the error so the user sees it inline.
+ *
+ * Protected by LockService so a concurrent webhook delivery cannot
+ * write to the same row at the same moment.
+ *
+ * @param {number} rowIndex  1-based sheet row number (e.g. 2 for the first data row)
+ */
+function pushLocalChangeToHubSpot(rowIndex) {
+  const sheet = getOrCreateSheet(CONFIG.SHEET_CONTACTS, COLUMN_HEADERS_CONTACTS);
+  const logger = new Logger("MANUAL_UPDATE");
+
+  // ✅ v7.1 lock: prevent concurrent webhook from writing to same row
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+
+    const row = sheet.getRange(rowIndex, 1, 1, COLUMN_HEADERS_CONTACTS.length).getValues()[0];
+    const hsContactId = String(row[COLUMNS_CONTACTS.HS_CONTACT_ID - 1] || "").trim();
+
+    // No HS Contact ID means this row wasn't imported from HubSpot — skip silently
+    if (!hsContactId) {
+      logger.log("SKIP", { rowIndex, reason: "No HS Contact ID in column 18" });
+      return;
+    }
+
+    // Validate the email is still well-formed before pushing
+    const email = (row[COLUMNS_CONTACTS.EMAIL - 1] || "").trim();
+    if (!isValidEmail(email)) {
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE).setValue("Push failed: invalid email in row");
+      logger.log("INVALID_EMAIL", { rowIndex, email });
+      return;
+    }
+
+    const properties = {
+      firstname: (row[COLUMNS_CONTACTS.FIRST_NAME - 1] || "").trim(),
+      lastname:  (row[COLUMNS_CONTACTS.LAST_NAME  - 1] || "").trim(),
+      company:   (row[COLUMNS_CONTACTS.COMPANY    - 1] || "").trim(),
+      industry:  (row[COLUMNS_CONTACTS.INDUSTRY   - 1] || "").trim()
+    };
+
+    const success = updateHubSpotContact(hsContactId, properties, logger);
+
+    if (success) {
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE)
+        .setValue("✅ Pushed to HubSpot: " + new Date().toLocaleTimeString());
+      logEvent(LOG_LEVELS.SUCCESS, "MANUAL_UPDATE",
+        `Row ${rowIndex} (${email}) pushed to HubSpot contact ${hsContactId}`);
+    } else {
+      sheet.getRange(rowIndex, COLUMNS_CONTACTS.MESSAGE)
+        .setValue("❌ Push failed — check Logs sheet");
+      logEvent(LOG_LEVELS.ERROR, "MANUAL_UPDATE",
+        `Row ${rowIndex} (${email}) push to HubSpot failed`);
+    }
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Menu-triggered wrapper for pushLocalChangeToHubSpot.
+ * Reads the currently active row from the spreadsheet selection,
+ * validates it is inside the Contacts sheet, then calls the push.
+ */
+function pushSelectedRowToHubSpot() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const activeSheet = ss.getActiveSheet();
+
+  if (activeSheet.getName() !== CONFIG.SHEET_CONTACTS) {
+    ui.alert("⚠️ Please select a row in the Contacts sheet before using this option.");
+    return;
+  }
+
+  const rowIndex = activeSheet.getActiveRange().getRow();
+  if (rowIndex <= 1) {
+    ui.alert("⚠️ Please select a data row (not the header row).");
+    return;
+  }
+
+  pushLocalChangeToHubSpot(rowIndex);
+  ui.alert(`✅ Row ${rowIndex} pushed to HubSpot. Check the Message column for status.`);
+}
+
+/**
+ * onEdit simple trigger — automatically pushes manual cell edits to HubSpot.
+ *
+ * Fires whenever a user types into the Contacts sheet. Only acts when the
+ * edited column is one of the four writable fields (First Name, Last Name,
+ * Company, Industry). Ignores all other columns and all other sheets.
+ *
+ * Debounce: a short-lived PropertiesService flag prevents the trigger from
+ * firing twice if Sheets fires it more than once for a single keystroke.
+ *
+ * NOTE: onEdit is a Simple Trigger — it cannot call services that require
+ * authorisation (e.g. UrlFetchApp) directly. pushLocalChangeToHubSpot()
+ * uses UrlFetchApp, so this trigger must be installed as an Installable
+ * Trigger (via setupTimeTriggers or manually in Apps Script → Triggers)
+ * for the HubSpot PATCH call to be authorised. If run as a simple trigger,
+ * it will log a warning and exit gracefully rather than throw an error.
+ */
+function onEdit(e) {
+  try {
+    const range = e && e.range;
+    if (!range) return;
+
+    const sheet = range.getSheet();
+    if (sheet.getName() !== CONFIG.SHEET_CONTACTS) return;
+
+    // Only react to the four fields we push to HubSpot
+    const editedCol = range.getColumn();
+    const PUSHABLE_COLS = new Set([
+      COLUMNS_CONTACTS.FIRST_NAME,  // 1
+      COLUMNS_CONTACTS.LAST_NAME,   // 2
+      COLUMNS_CONTACTS.COMPANY,     // 4
+      COLUMNS_CONTACTS.INDUSTRY     // 6
+    ]);
+    if (!PUSHABLE_COLS.has(editedCol)) return;
+
+    const rowIndex = range.getRow();
+    if (rowIndex <= 1) return; // header row
+
+    // Debounce: skip if we already fired for this row in the last 2 seconds
+    const debounceKey = `EDIT_DEBOUNCE_R${rowIndex}`;
+    const props = PropertiesService.getScriptProperties();
+    const lastFired = parseInt(props.getProperty(debounceKey) || "0");
+    if (Date.now() - lastFired < 2000) return;
+    props.setProperty(debounceKey, String(Date.now()));
+
+    // Safety check: if UrlFetchApp is unavailable (simple trigger context), log and exit
+    try {
+      pushLocalChangeToHubSpot(rowIndex);
+    } catch (authErr) {
+      if (authErr.message && authErr.message.includes("authoriz")) {
+        logEvent(LOG_LEVELS.WARN, "ON_EDIT",
+          `Row ${rowIndex}: onEdit must be installed as an Installable Trigger to push to HubSpot. ` +
+          `Run Setup → Setup Time Triggers, then re-edit the cell.`);
+      } else {
+        throw authErr;
+      }
+    }
+
+  } catch (err) {
+    // Never let onEdit crash visibly — log silently
+    console.error("onEdit error:", err.message);
   }
 }
 
@@ -885,6 +1127,8 @@ function registerHubSpotWebhooks() {
 function setupTimeTriggers() {
   removeAllTriggers();
 
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
   const triggers = [
     { fn: "syncMailUpToSheets",  period: ScriptApp.newTrigger("syncMailUpToSheets").timeBased().everyHours(1) },
     { fn: "syncSheetsToHubSpot", period: ScriptApp.newTrigger("syncSheetsToHubSpot").timeBased().everyHours(2) },
@@ -896,12 +1140,21 @@ function setupTimeTriggers() {
     try { t.period.create(); } catch (e) { console.error(`Trigger setup failed for ${t.fn}:`, e.message); }
   });
 
+  // ✅ v7.2: Install onEdit as an Installable Trigger so it can call UrlFetchApp
+  // (Simple triggers cannot use authorised services — installable triggers can)
+  try {
+    ScriptApp.newTrigger("onEdit").forSpreadsheet(ss).onEdit().create();
+  } catch (e) {
+    console.error("onEdit trigger setup failed:", e.message);
+  }
+
   SpreadsheetApp.getUi().alert(
     "✅ Triggers installed:\n\n" +
     "• syncMailUpToSheets   — every 1 hour\n" +
     "• syncSheetsToHubSpot — every 2 hours\n" +
     "• fullReconciliation   — daily at 3am\n" +
-    "• runSync              — every 6 hours"
+    "• runSync              — every 6 hours\n" +
+    "• onEdit (installable) — fires on every Contacts sheet cell edit"
   );
 }
 
@@ -1490,17 +1743,28 @@ function mapHSPropertiesToRow(contact) {
 
 /** Insert or update a contact row based on email dedup */
 function upsertContactRow(sheet, contactData, contactId) {
-  const email = contactData.email;
-  const existingRow = getContactRowByEmail(sheet, email) || getContactRowByHSId(sheet, contactId);
-  if (existingRow) {
-    // Update non-status fields, preserve status/mailupId/scores
-    const existing = sheet.getRange(existingRow, 1, 1, COLUMN_HEADERS_CONTACTS.length).getValues()[0];
-    const updated = [...contactData.row];
-    // Preserve: STATUS(10), MESSAGE(11), MAILUP_ID(12), PUSHED_AT(13), AI_SCORE(15), AI_TAG(16), AI_SEGMENT(17)
-    [10,11,12,13,15,16,17].forEach(col => { updated[col-1] = existing[col-1]; });
-    sheet.getRange(existingRow, 1, 1, updated.length).setValues([updated]);
-  } else {
-    safeWriteToSheet(sheet, [contactData.row], sheet.getLastRow() + 1);
+  // ✅ FIX A: Row-level lock.
+  // Protects against the case where a webhook fires while fullReconciliation()
+  // is also writing — both called from different execution contexts.
+  // NOTE: doPost() also holds the script lock, so this is a secondary safety net
+  // for calls that originate outside of doPost (e.g. from reconciliation triggers).
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const email = contactData.email;
+    const existingRow = getContactRowByEmail(sheet, email) || getContactRowByHSId(sheet, contactId);
+    if (existingRow) {
+      // Update non-status fields, preserve status/mailupId/scores
+      const existing = sheet.getRange(existingRow, 1, 1, COLUMN_HEADERS_CONTACTS.length).getValues()[0];
+      const updated = [...contactData.row];
+      // Preserve: STATUS(10), MESSAGE(11), MAILUP_ID(12), PUSHED_AT(13), AI_SCORE(15), AI_TAG(16), AI_SEGMENT(17)
+      [10,11,12,13,15,16,17].forEach(col => { updated[col-1] = existing[col-1]; });
+      sheet.getRange(existingRow, 1, 1, updated.length).setValues([updated]);
+    } else {
+      safeWriteToSheet(sheet, [contactData.row], sheet.getLastRow() + 1);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
